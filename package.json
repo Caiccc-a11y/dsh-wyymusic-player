@@ -1,0 +1,36 @@
+{
+  "name": "@local/dsh-netease-music",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NetEase Cloud Music in the DSH right sidebar.",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml"
+  ],
+  "meta": {
+    "title": "网易云音乐",
+    "description": "在 DSH 右侧栏播放网易云音乐：账号登录、歌单播放与播放方式切换。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}
