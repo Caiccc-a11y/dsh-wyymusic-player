@@ -154,17 +154,6 @@ export function apply(ctx, config = {}) {
         return;
       }
 
-      if (pathname === '/login/phone' && req.method === 'POST') {
-        const body = await readBody(req);
-        if (!body.phone || !body.password) {
-          sendJson(res, 400, { ok: false, error: '请填写手机号与密码' });
-          return;
-        }
-        const status = await client.loginCellphone(String(body.phone), String(body.password), String(body.countrycode || '86'));
-        sendJson(res, 200, { ok: true, ...status });
-        return;
-      }
-
       if (pathname === '/login/captcha/sent' && req.method === 'POST') {
         const body = await readBody(req);
         if (!body.phone) {

@@ -137,13 +137,10 @@ window.__ModuleLoader__.load({
         loginPhone: '手机号登录',
         loginCookie: 'Cookie 登录',
         phone: '手机号',
-        password: '密码',
         captcha: '验证码',
         sendCaptcha: '发送验证码',
         resendIn: '{seconds}s 后重发',
         captchaSent: '验证码已发送',
-        byPassword: '用密码登录',
-        byCaptcha: '用验证码登录',
         cookieHint: '在浏览器登录 music.163.com，复制 document.cookie 粘贴到这里',
         cookiePlaceholder: 'MUSIC_U=...; __csrf=...',
         submit: '登录',
@@ -215,13 +212,10 @@ window.__ModuleLoader__.load({
         loginPhone: 'Phone',
         loginCookie: 'Cookie',
         phone: 'Phone number',
-        password: 'Password',
         captcha: 'Code',
         sendCaptcha: 'Send code',
         resendIn: 'Resend in {seconds}s',
         captchaSent: 'Code sent',
-        byPassword: 'Use password',
-        byCaptcha: 'Use SMS code',
         cookieHint: 'Sign in at music.163.com, then paste document.cookie here',
         cookiePlaceholder: 'MUSIC_U=...; __csrf=...',
         submit: 'Sign in',
@@ -979,6 +973,24 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
       let lyricToken = 0;
       let clockTimer = null;
       let clockSeconds = -1;
+      // A seek is in flight. `seeked` fires as soon as the jump is *issued* — measured:
+      // it arrives while `audio.currentTime` still reports the pre-seek spot (notably on
+      // Windows, where the media pipeline lags the instruction), so the next
+      // timeupdate/clockTick would write that stale reading back into the store and snap
+      // the scrubber to the start of the song. The guard therefore ignores element
+      // readings until the clock has actually moved onto (or past) the chosen spot, with
+      // a deadline so a genuinely stalled element cannot freeze the progress bar forever.
+      let seekTarget = -1;
+      let seekStartedAt = 0;
+      function positionUsable() {
+        if (seekTarget < 0) return true;
+        if (Date.now() - seekStartedAt > 5000) { seekTarget = -1; return true; }
+        return false;
+      }
+      function positionArrived(seconds) {
+        if (seekTarget < 0) return;
+        if (seconds >= seekTarget - 1.5 || Date.now() - seekStartedAt > 5000) seekTarget = -1;
+      }
 
       /**
        * Ten commits a second while a line is actually being sung, so the active
@@ -1014,6 +1026,10 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
         const seconds = Math.floor(now);
         if (seconds === clockSeconds) return;
         clockSeconds = seconds;
+        // While a seek is still settling, the element clock reports the pre-seek spot;
+        // writing it here is exactly the snap-back. Wait until it reaches the target.
+        if (!positionUsable()) return;
+        positionArrived(now);
         store.set({ position: now });
       }
 
@@ -1056,6 +1072,10 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
           // One store commit per second keeps the progress bar honest without
           // re-rendering the whole panel on every audio frame.
           if (Math.floor(audio.currentTime) !== Math.floor(store.getState().position)) {
+            // A settling seek must not be overwritten by the stale pre-seek reading,
+            // or the scrubber snaps back to the start (measured on Windows).
+            if (!positionUsable()) return;
+            positionArrived(audio.currentTime);
             store.set({ position: audio.currentTime });
           }
         });
@@ -1076,6 +1096,11 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
           syncClock();
         });
         audio.addEventListener('waiting', () => store.set({ loading: true }));
+        // The media pipeline has finished the jump: the element clock is trustworthy again.
+        // Note: `seeked` intentionally does NOT clear the guard — it fires while the
+        // element clock still reads the pre-seek position, which is exactly the stale
+        // reading the guard exists to drop. `positionArrived` clears it once the clock
+        // reaches the chosen spot (or the 5s deadline expires).
         audio.addEventListener('playing', () => {
           store.set({ loading: false, error: '' });
           syncClock();
@@ -1340,12 +1365,18 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
         seek(seconds) {
           if (!audio) return;
           try {
+            // Arm the guard *before* touching the element: the very next timeupdate can
+            // still carry the pre-seek position (seeked alone does not mean the clock
+            // has moved — measured it fires while currentTime still reads the old spot).
+            seekTarget = seconds;
+            seekStartedAt = Date.now();
             audio.currentTime = seconds;
             store.set({ position: seconds });
             const state = store.getState();
             if (state.lyrics.length) store.set({ lyricIndex: lineIndexAt(state.lyrics, seconds) });
           } catch {
             /* not seekable yet */
+            seekTarget = -1;
           }
         },
         setVolume(value) {
@@ -1858,9 +1889,7 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
     function LoginPanel({ store, onDone }) {
       const [method, setMethod] = useState('phone');
       const [phone, setPhone] = useState('');
-      const [password, setPassword] = useState('');
       const [captcha, setCaptcha] = useState('');
-      const [useCaptcha, setUseCaptcha] = useState(true);
       const [countdown, setCountdown] = useState(0);
       const [busy, setBusy] = useState(false);
       const [cookie, setCookie] = useState('');
@@ -1889,14 +1918,14 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
 
       const submitPhone = async (event) => {
         event.preventDefault();
-        if (!phone.trim()) return;
+        if (!phone.trim() || !captcha.trim()) return;
         setBusy(true);
         setMessage('');
         try {
-          const body = useCaptcha
-            ? { phone: phone.trim(), captcha: captcha.trim() }
-            : { phone: phone.trim(), password };
-          const payload = await api(useCaptcha ? '/login/captcha' : '/login/phone', { method: 'POST', body });
+          const payload = await api('/login/captcha', {
+            method: 'POST',
+            body: { phone: phone.trim(), captcha: captcha.trim() },
+          });
           onDone(payload);
         } catch (error) {
           setMessage(error.message);
@@ -1946,41 +1975,27 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
                 onChange: (event) => setPhone(event.target.value),
                 'aria-label': t('phone'),
               }),
-              useCaptcha
-                ? h(
-                    'div',
-                    { className: 'wyym-row' },
-                    h('input', {
-                      className: 'wyym-input',
-                      value: captcha,
-                      inputMode: 'numeric',
-                      placeholder: t('captcha'),
-                      onChange: (event) => setCaptcha(event.target.value),
-                      'aria-label': t('captcha'),
-                    }),
-                    h(
-                      'button',
-                      { type: 'button', className: 'wyym-btn', disabled: busy || countdown > 0, onClick: sendCaptcha },
-                      countdown > 0 ? t('resendIn', { seconds: countdown }) : t('sendCaptcha'),
-                    ),
-                  )
-                : h('input', {
-                    className: 'wyym-input',
-                    value: password,
-                    type: 'password',
-                    placeholder: t('password'),
-                    onChange: (event) => setPassword(event.target.value),
-                    'aria-label': t('password'),
-                  }),
+              h(
+                'div',
+                { className: 'wyym-row' },
+                h('input', {
+                  className: 'wyym-input',
+                  value: captcha,
+                  inputMode: 'numeric',
+                  placeholder: t('captcha'),
+                  onChange: (event) => setCaptcha(event.target.value),
+                  'aria-label': t('captcha'),
+                }),
+                h(
+                  'button',
+                  { type: 'button', className: 'wyym-btn', disabled: busy || countdown > 0, onClick: sendCaptcha },
+                  countdown > 0 ? t('resendIn', { seconds: countdown }) : t('sendCaptcha'),
+                ),
+              ),
               h(
                 'button',
                 { type: 'submit', className: 'wyym-btn wyym-primary', style: { justifyContent: 'center' }, disabled: busy },
                 busy ? t('loggingIn') : t('submit'),
-              ),
-              h(
-                'button',
-                { type: 'button', className: 'wyym-btn', style: { justifyContent: 'center' }, onClick: () => setUseCaptcha(!useCaptcha) },
-                useCaptcha ? t('byPassword') : t('byCaptcha'),
               ),
             )
           : null,

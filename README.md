@@ -9,11 +9,16 @@
 
 ### 登录与多账号
 
-- **手机号登录**:手机号 + 密码,或手机号 + 短信验证码(可先发送验证码)
+- **手机号登录**:手机号 + 短信验证码(可先发送验证码)
 - **Cookie 登录**:粘贴浏览器里的网易云 Cookie(需含 `MUSIC_U`)
 - **多账号保存与切换**:右上角头像点开账号列表,可切换、添加用户或退出当前账号;
   各账号的 Cookie 独立保存,一个账号失效不影响其他账号
-- 登录态保存在 `$DSH_HOME/netease-music/session.json`(权限 0600),浏览器侧不持有 Cookie
+- 登录态保存在 `$DSH_HOME/wyymusic-player/session.json`(权限 0600),浏览器侧不持有 Cookie
+
+> **密码登录已移除。** 网易云对 `/weapi/login/cellphone` 的风控极严:密码登录会先被
+> `400 登录失败,请进行安全验证`、`10004 当前登录存在安全风险` 等拦下(此时服务器
+> 根本不会校验密码,对错都一样),且反复尝试可能连累账号被临时限制。验证码与
+> Cookie 两种方式不受影响。
 
 ### 播放
 
@@ -71,10 +76,10 @@ target: /home/你的用户名/dsh-wyymusic-player
 
 ```bash
 rm -rf /path/to/dsh-wyymusic-player          # 插件目录
-rm -rf "$DSH_HOME/netease-music"           # 登录态(session.json,含所有已保存账号的 Cookie)
+rm -rf "$DSH_HOME/wyymusic-player"          # 登录态(session.json,含所有已保存账号的 Cookie)
 ```
 
-> 不删除 `$DSH_HOME/netease-music` 的话,下次重新安装可以沿用之前登录的账号。
+> 不删除 `$DSH_HOME/wyymusic-player` 的话,下次重新安装可以沿用之前登录的账号。
 
 ## 许可证
 
