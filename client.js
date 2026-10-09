@@ -1,7 +1,7 @@
 /**
  * Browser half of the NetEase Cloud Music plugin.
  *
- * Registers one right-Sidebar tab type (`netease-music`) through the same public
+ * Registers one right-Sidebar tab type (`wyymusic-player`) through the same public
  * two-stage path a shipped provider uses — `ctx.sidebarRightTabs.register` for
  * the type, a `sidebar.right.pane.tab` registration for the body — and renders
  * the player inside it.
@@ -14,23 +14,23 @@
  * localStorage preferences as the volume and the play mode.
  *
  * Everything here is plain JavaScript: React comes from the browser module
- * table, the Host half is reached over `/api/dsh-netease-music`, and every
+ * table, the Host half is reached over `/api/dsh-wyymusic-player`, and every
  * colour comes from a `--dsw-alias-*` theme token so the panel follows the DSH
  * theme and whatever a skin plugin (dsh-web-all's skin center) overrides.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-netease-music',
+  id: '@local/dsh-wyymusic-player',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
     const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-    const PACKAGE_ID = '@local/dsh-netease-music';
-    const NS = 'neteaseMusic';
-    const KIND = 'netease-music';
-    const API = '/api/dsh-netease-music';
-    const PREF_KEY = 'dsh.netease-music.prefs';
-    const OPENED_KEY = 'dsh.netease-music.autoOpened';
+    const PACKAGE_ID = '@local/dsh-wyymusic-player';
+    const NS = 'wyyMusicPlayer';
+    const KIND = 'wyymusic-player';
+    const API = '/api/dsh-wyymusic-player';
+    const PREF_KEY = 'dsh.wyymusic-player.prefs';
+    const OPENED_KEY = 'dsh.wyymusic-player.autoOpened';
 
     // How often the clock checks which lyric line is current. It is a binary
     // search over the timeline and only commits to the store when the line or
@@ -67,19 +67,7 @@ window.__ModuleLoader__.load({
     // Fallback pace when the song has too few lines to measure one (s/char).
     const LRC_FALLBACK_SECONDS_PER_CHAR = 0.5;
     // Column count of the dock's spectrum strip (the analyser is sampled into this many bands).
-    /** Column count of the spectrum strip; the drawn shape is mirrored around its center. */
     const PULSE_COLUMNS = 16;
-    /** Half of the mirrored columns — the right half is the left half played backwards. */
-    const PULSE_HALF = PULSE_COLUMNS / 2;
-    /**
-     * Share of the analyser's bins that actually carries music. With fftSize=64 the
-     * analyser hands over 32 bins and a pop mix concentrates its energy in the low
-     * third; mapping all 32 bins straight across the strip (the previous behaviour)
-     * left the right half of the strip as a flat 8% plain, so the whole visual
-     * huddled against the left edge. Sampling only the musical range and mirroring
-     * it outward from the center uses the full width instead.
-     */
-    const PULSE_BIN_SHARE = 0.6;
 
     // ------------------------------------------------------------ vocabulary --
 
@@ -534,44 +522,62 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Turn the sampled columns into a spectrum area: a stepped top edge plus the
-     * same edge closed down to the baseline, so the shape reads as filled bands.
+     * The strip's current themed fill colour. Read from CSS (the canvas carries
+     * `color: var(--dsw-alias-brand-primary)`) so themes and skin plugins keep
+     * working without a second source of truth.
      */
-    function pulsePaths(steps) {
-      // SVG y grows downward, so a bar of "value" height sits with its top edge
-      // at y = 100 - value: louder (bigger value) → taller bar reaching the top.
-      const width = steps.length;
-      let area = `M0 100`;
-      for (let index = 0; index < width; index += 1) {
-        area += `L${index} ${100 - steps[index]}L${index + 1} ${100 - steps[index]}`;
+    function pulseColor(canvas) {
+      try {
+        const value = window.getComputedStyle(canvas).color;
+        return value && value !== 'rgba(0, 0, 0, 0)' ? value : '#7aaaff';
+      } catch {
+        return '#7aaaff';
       }
-      return { area: `${area}L${width} 100Z` };
     }
 
     /**
-     * Sample the analyser into the LEFT half of the strip, then mirror it so the
-     * strip is symmetric around its vertical center — bass peaks meet in the
-     * middle instead of piling up at the left edge. `freq` is the raw byte array;
-     * returns one height per drawn column, left to right.
+     * Paint the stepped spectrum area onto a canvas.
+     *
+     * Canvas, not an SVG path: rewriting a path's `d` every frame dirties SVG
+     * geometry and costs a style recalculation per frame — measured on this
+     * machine, the strip took the page from 61 to 181 style recalcs per second,
+     * and on a weak integrated GPU that per-frame re-raster is what made the
+     * bars stutter on busy tracks. Drawing pixels invalidates nothing outside
+     * the canvas, so a frame costs one small bitmap fill.
+     */
+    function drawPulse(canvas, heights, color) {
+      const ctx = typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
+      if (!ctx) return;
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = color;
+      for (let column = 0; column < PULSE_COLUMNS; column += 1) {
+        // Round to device pixels so neighbouring columns meet without a seam.
+        const left = Math.round((column / PULSE_COLUMNS) * width);
+        const right = Math.round(((column + 1) / PULSE_COLUMNS) * width);
+        const bar = Math.max(1, Math.round((heights[column] / 100) * height));
+        ctx.fillRect(left, height - bar, Math.max(1, right - left), bar);
+      }
+    }
+
+    /**
+     * Sample the analyser straight across the strip: all bins, in frequency
+     * order, left to right. This is the original behaviour the user asked to
+     * restore — a plain frequency sweep with the energy (bass) at the left edge
+     * and the natural decay toward the right. No bin cropping, no rotation,
+     * no mirroring: what you see is the spectrum as the analyser reports it.
      */
     function pulseHeights(freq) {
-      // Only the musical range: the top bins are near-silent in a normal mix and
-      // would read as dead columns.
-      const usable = Math.max(PULSE_HALF, Math.round(freq.length * PULSE_BIN_SHARE));
-      const heights = new Array(PULSE_HALF);
-      for (let column = 0; column < PULSE_HALF; column += 1) {
-        const from = Math.floor((column / PULSE_HALF) * usable);
-        const to = Math.max(from + 1, Math.floor(((column + 1) / PULSE_HALF) * usable));
+      const columns = new Array(PULSE_COLUMNS);
+      const bins = freq.length;
+      for (let column = 0; column < PULSE_COLUMNS; column += 1) {
+        const from = Math.floor((column / PULSE_COLUMNS) * bins);
+        const to = Math.max(from + 1, Math.floor(((column + 1) / PULSE_COLUMNS) * bins));
         let sum = 0;
         for (let bin = from; bin < to; bin += 1) sum += freq[bin];
         const avg = sum / (to - from);
-        heights[column] = Math.max(8, Math.min(100, Math.round((avg / 255) * 100)));
-      }
-      // Mirror: left half runs low→high toward the center, right half is the
-      // reversal, so the two halves meet at the tallest (bass) column in the middle.
-      const columns = new Array(PULSE_COLUMNS);
-      for (let column = 0; column < PULSE_COLUMNS; column += 1) {
-        columns[column] = column < PULSE_HALF ? heights[PULSE_HALF - 1 - column] : heights[column - PULSE_HALF];
+        columns[column] = Math.max(8, Math.min(100, Math.round((avg / 255) * 100)));
       }
       return columns;
     }
@@ -653,31 +659,31 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------ style --
 
     const CSS = `
-.nenm-root{position:relative;display:flex;flex-direction:column;gap:10px;height:100%;min-height:0;overflow:hidden;box-sizing:border-box;padding:10px 10px 12px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px}
-.nenm-root *,.nenm-root *::before,.nenm-root *::after{box-sizing:border-box}
-.nenm-muted{color:var(--dsw-alias-label-secondary)}
-.nenm-faint{color:var(--dsw-alias-label-secondary);opacity:.78}
-.nenm-row{display:flex;align-items:center;gap:8px}
-.nenm-col{display:flex;flex-direction:column;gap:8px;min-height:0}
+.wyym-root{position:relative;display:flex;flex-direction:column;gap:10px;height:100%;min-height:0;overflow:hidden;box-sizing:border-box;padding:10px 10px 12px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px}
+.wyym-root *,.wyym-root *::before,.wyym-root *::after{box-sizing:border-box}
+.wyym-muted{color:var(--dsw-alias-label-secondary)}
+.wyym-faint{color:var(--dsw-alias-label-secondary);opacity:.78}
+.wyym-row{display:flex;align-items:center;gap:8px}
+.wyym-col{display:flex;flex-direction:column;gap:8px;min-height:0}
 /* Body region: the only part that flexes, so it owns the remaining height and scrolls. */
-.nenm-main{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px}
+.wyym-main{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px}
 /* Player bar: pinned to the bottom and never squashed by the flex container, so its
    transport row can no longer overflow and paint over the list above it. */
-.nenm-player{flex:0 0 auto;display:flex;flex-direction:column;gap:8px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l1)}
+.wyym-player{flex:0 0 auto;display:flex;flex-direction:column;gap:8px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l1)}
 /* Player foot: the dock switch alone, right-aligned under the volume control. */
 /* Queue position / playlist name on the left, dock switch level with it on the right. */
-.nenm-playerFoot{display:flex;align-items:center;gap:8px;min-height:20px}
-.nenm-playerFoot .nenm-switch{margin-left:auto}
-.nenm-switch{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--dsw-alias-label-secondary);font-size:11px}
-.nenm-switch:hover{color:var(--dsw-alias-label-primary)}
-.nenm-switchLabel{white-space:nowrap}
-.nenm-switchTrack{position:relative;flex:0 0 auto;width:28px;height:16px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);transition:background-color .14s,border-color .14s}
-.nenm-switchKnob{position:absolute;top:1px;left:1px;width:12px;height:12px;border-radius:50%;background:var(--dsw-alias-label-secondary);transition:transform .14s,background-color .14s}
-.nenm-switchInput{position:absolute;width:1px;height:1px;margin:0;padding:0;opacity:0;pointer-events:none}
-.nenm-switchInput:checked~.nenm-switchTrack{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
-.nenm-switchInput:checked~.nenm-switchTrack .nenm-switchKnob{background:var(--dsw-alias-bg-base);transform:translateX(12px)}
-.nenm-switchInput:focus-visible~.nenm-switchTrack{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
-@media (prefers-reduced-motion:reduce){.nenm-switchTrack,.nenm-switchKnob{transition:none}}
+.wyym-playerFoot{display:flex;align-items:center;gap:8px;min-height:20px}
+.wyym-playerFoot .wyym-switch{margin-left:auto}
+.wyym-switch{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--dsw-alias-label-secondary);font-size:11px}
+.wyym-switch:hover{color:var(--dsw-alias-label-primary)}
+.wyym-switchLabel{white-space:nowrap}
+.wyym-switchTrack{position:relative;flex:0 0 auto;width:28px;height:16px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);transition:background-color .14s,border-color .14s}
+.wyym-switchKnob{position:absolute;top:1px;left:1px;width:12px;height:12px;border-radius:50%;background:var(--dsw-alias-label-secondary);transition:transform .14s,background-color .14s}
+.wyym-switchInput{position:absolute;width:1px;height:1px;margin:0;padding:0;opacity:0;pointer-events:none}
+.wyym-switchInput:checked~.wyym-switchTrack{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.wyym-switchInput:checked~.wyym-switchTrack .wyym-switchKnob{background:var(--dsw-alias-bg-base);transform:translateX(12px)}
+.wyym-switchInput:focus-visible~.wyym-switchTrack{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){.wyym-switchTrack,.wyym-switchKnob{transition:none}}
 /* Lyrics dock above the composer. It is a sibling of the composer card rather
    than a child, and nothing inside it is interactive. The negative margin eats the
    stack gap so it reads as attached to the card below it.
@@ -692,7 +698,7 @@ window.__ModuleLoader__.load({
    now 0 on both sides. The percentage resolves against the same stack the card
    does, and --dsh-composer-card-max-width is a length, so the capping regime
    matches too. */
-.nenm-dock{display:grid;grid-template-rows:0fr;box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance));max-width:var(--dsh-composer-card-max-width);margin:0 auto 0;padding:0;pointer-events:none;user-select:none;overflow:hidden;will-change:grid-template-rows,opacity,transform}
+.wyym-dock{display:grid;grid-template-rows:0fr;box-sizing:border-box;flex:none;width:calc(100% - var(--dsh-composer-side-clearance) - var(--dsh-composer-side-clearance));max-width:var(--dsh-composer-card-max-width);margin:0 auto 0;padding:0;pointer-events:none;user-select:none;overflow:hidden;will-change:grid-template-rows,opacity,transform}
 /* Open/close animation. The strip is never unmounted — it keeps its slot and
    animates its own height, margin, opacity and a small slide, so opening and
    closing run the exact same transition in both directions. Closed it collapses
@@ -733,18 +739,18 @@ window.__ModuleLoader__.load({
    The delay must be written as the literal duration of the other segment (not a
    shared token) because the browser resolves transition-delay independently of
    transition-duration; a mismatch is exactly the dead gap above. */
-.nenm-dock[data-open=true]{grid-template-rows:1fr;margin-bottom:calc(0px - var(--dsh-composer-stack-gap) - 3px);opacity:1;transform:translateY(0);transition:grid-template-rows .24s cubic-bezier(0,0,.58,1) .16s,margin-bottom .24s cubic-bezier(0,0,.58,1) .16s,opacity .24s cubic-bezier(0,0,.58,1) .16s,transform .24s cubic-bezier(0,0,.58,1) .16s}
-.nenm-dock[data-open=false]{grid-template-rows:0fr;margin-bottom:0;opacity:0;transform:translateY(6px);transition:grid-template-rows .24s cubic-bezier(.42,0,1,1),margin-bottom .24s cubic-bezier(.42,0,1,1),opacity .24s cubic-bezier(.42,0,1,1),transform .24s cubic-bezier(.42,0,1,1)}
+.wyym-dock[data-open=true]{grid-template-rows:1fr;margin-bottom:calc(0px - var(--dsh-composer-stack-gap) - 3px);opacity:1;transform:translateY(0);transition:grid-template-rows .24s cubic-bezier(0,0,.58,1) .16s,margin-bottom .24s cubic-bezier(0,0,.58,1) .16s,opacity .24s cubic-bezier(0,0,.58,1) .16s,transform .24s cubic-bezier(0,0,.58,1) .16s}
+.wyym-dock[data-open=false]{grid-template-rows:0fr;margin-bottom:0;opacity:0;transform:translateY(6px);transition:grid-template-rows .24s cubic-bezier(.42,0,1,1),margin-bottom .24s cubic-bezier(.42,0,1,1),opacity .24s cubic-bezier(.42,0,1,1),transform .24s cubic-bezier(.42,0,1,1)}
 /* min-height:0 + overflow:hidden is what lets the grid row collapse to zero and
    expand to the content height. The padding deliberately lives on the panel
    *inside* this clip element rather than on the clip itself: a grid item's own
    vertical padding cannot shrink, so putting it here left a ~14px sliver on
    screen with the strip "closed" (measured), while nesting it one level deeper
    collapses cleanly to the border. */
-.nenm-dockClip{min-height:0;overflow:hidden}
-.nenm-dockPanel{position:relative;isolation:isolate;display:flex;align-items:center;gap:12px;padding:7px 12px;border-radius:var(--dsw-radius-panel) var(--dsw-radius-panel) 0 0;overflow:hidden}
-.nenm-dockPanel:before{content:'';position:absolute;inset:0;z-index:-1;border-radius:inherit;background:var(--dsw-alias-bg-layer-1)}
-.nenm-dockPanel:after{content:'';position:absolute;inset:0;z-index:-1;border:.5px solid var(--dsw-alias-border-l2);border-bottom:none;border-radius:inherit}
+.wyym-dockClip{min-height:0;overflow:hidden}
+.wyym-dockPanel{position:relative;isolation:isolate;display:flex;align-items:center;gap:12px;padding:7px 12px;border-radius:var(--dsw-radius-panel) var(--dsw-radius-panel) 0 0;overflow:hidden}
+.wyym-dockPanel:before{content:'';position:absolute;inset:0;z-index:-1;border-radius:inherit;background:var(--dsw-alias-bg-layer-1)}
+.wyym-dockPanel:after{content:'';position:absolute;inset:0;z-index:-1;border:.5px solid var(--dsw-alias-border-l2);border-bottom:none;border-radius:inherit}
 /* The strip must not leave a notch where it meets the composer card.
    The strip is a rounded-top / square-bottom slab sitting exactly on the card's top
    edge, and the card keeps its own 28px top corners. The two shapes therefore meet at
@@ -779,31 +785,31 @@ window.__ModuleLoader__.load({
    unconditionally so it is still in effect on the frame the attribute flips.
    The card is reached through the composer stack rather than by class name: the dock's
    own parent is a display:contents slot host (so the card is not a sibling the dock can
-   select), and the shell's class names are content-hashed. div:has(> * > .nenm-dock)
+   select), and the shell's class names are content-hashed. div:has(> * > .wyym-dock)
    names the stack structurally, and [data-composer-card] is the shell's own stable hook.
    NOTE: this replaces the card's own transition:all (which resolves to a 0s duration
    today, so nothing else was animating) with just these two radii. */
-div:has(> * > .nenm-dock) [data-composer-card=true]{transition:border-top-left-radius .16s cubic-bezier(0,0,.58,1) .24s,border-top-right-radius .16s cubic-bezier(0,0,.58,1) .24s}
-div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{border-top-left-radius:0;border-top-right-radius:0;transition:border-top-left-radius .16s cubic-bezier(.42,0,1,1),border-top-right-radius .16s cubic-bezier(.42,0,1,1)}
-.nenm-dockLead{display:flex;align-items:center;gap:10px;min-width:0;flex:0 0 auto;max-width:46%}
-.nenm-dockCover{flex:0 0 auto;width:34px;height:34px;border-radius:7px;background:var(--dsw-alias-bg-layer-2) center/cover no-repeat;object-fit:cover;overflow:hidden}
-.nenm-dockMeta{display:flex;flex-direction:column;justify-content:center;min-width:0}
-.nenm-dockTitle{font-size:13px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nenm-dockArtist{font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+div:has(> * > .wyym-dock) [data-composer-card=true]{transition:border-top-left-radius .16s cubic-bezier(0,0,.58,1) .24s,border-top-right-radius .16s cubic-bezier(0,0,.58,1) .24s}
+div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{border-top-left-radius:0;border-top-right-radius:0;transition:border-top-left-radius .16s cubic-bezier(.42,0,1,1),border-top-right-radius .16s cubic-bezier(.42,0,1,1)}
+.wyym-dockLead{display:flex;align-items:center;gap:10px;min-width:0;flex:0 0 auto;max-width:46%}
+.wyym-dockCover{flex:0 0 auto;width:34px;height:34px;border-radius:7px;background:var(--dsw-alias-bg-layer-2) center/cover no-repeat;object-fit:cover;overflow:hidden}
+.wyym-dockMeta{display:flex;flex-direction:column;justify-content:center;min-width:0}
+.wyym-dockTitle{font-size:13px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wyym-dockArtist{font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* The three modules are laid out side by side and each one is responsible for
-   its own overflow. .nenm-dockLyrics stretches its children (not center):
+   its own overflow. .wyym-dockLyrics stretches its children (not center):
    with align-items:center the line box shrinks to its *content* width, so a
    long line measured 461px inside a 300px column and painted straight over the
    title and the visualiser. stretch plus overflow:hidden keeps every module
    inside its own box. */
-.nenm-dockLyrics{display:flex;flex-direction:column;justify-content:center;align-items:stretch;text-align:center;gap:1px;flex:1 1 auto;min-width:0;overflow:hidden}
+.wyym-dockLyrics{display:flex;flex-direction:column;justify-content:center;align-items:stretch;text-align:center;gap:1px;flex:1 1 auto;min-width:0;overflow:hidden}
 /* The lyric wraps instead of being truncated, so a narrow strip shows the whole
    line over several rows rather than an ellipsis. */
-.nenm-dockLine{position:relative;font-size:12.5px;line-height:17px;color:var(--dsw-alias-label-primary);overflow:hidden;white-space:normal;text-align:center;transition:color .18s,opacity .18s}
+.wyym-dockLine{position:relative;font-size:12.5px;line-height:17px;color:var(--dsw-alias-label-primary);overflow:hidden;white-space:normal;text-align:center;transition:color .18s,opacity .18s}
 /* The current line mounts as a fresh node (keyed by its index) and slides UP
    from below while fading in, so a line change reads as a transition. */
-.nenm-dockLine-enter{animation:nenm-dockLineIn .4s cubic-bezier(.22,.61,.36,1) both}
-@keyframes nenm-dockLineIn{from{opacity:0;transform:translateY(17px)}to{opacity:1;transform:translateY(0)}}
+.wyym-dockLine-enter{animation:wyym-dockLineIn .4s cubic-bezier(.22,.61,.36,1) both}
+@keyframes wyym-dockLineIn{from{opacity:0;transform:translateY(17px)}to{opacity:1;transform:translateY(0)}}
 /* Karaoke sweep, drawn one *syllable* at a time rather than as one clipped copy
    of the whole line.
    Why per-syllable: the strip has to wrap (a narrow composer must not push the
@@ -824,105 +830,104 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{border-top-l
    --dsw-alias-link is genuinely distinct in both themes, and the emphasis is
    carried by colour + glow rather than stroke weight, so the two layers keep
    identical metrics and the edge cannot drift. */
-.nenm-dockKaraoke{display:inline;white-space:normal;word-break:break-word}
-.nenm-dockSeg{display:inline-grid;white-space:pre;vertical-align:baseline}
-.nenm-dockSeg>*{grid-area:1/1;min-width:0}
-.nenm-dockSegBase{color:var(--dsw-alias-label-secondary);opacity:.55}
-.nenm-dockSegFill{color:var(--dsw-alias-link,#4176e6);-webkit-text-stroke:.45px currentColor;text-shadow:0 0 8px currentColor;text-shadow:0 0 8px color-mix(in srgb,currentColor 45%,transparent);clip-path:inset(0 100% 0 0);will-change:clip-path}
-.nenm-dockLine.is-idle{color:var(--dsw-alias-label-secondary)}
+.wyym-dockKaraoke{display:inline;white-space:normal;word-break:break-word}
+.wyym-dockSeg{display:inline-grid;white-space:pre;vertical-align:baseline}
+.wyym-dockSeg>*{grid-area:1/1;min-width:0}
+.wyym-dockSegBase{color:var(--dsw-alias-label-secondary);opacity:.55}
+.wyym-dockSegFill{color:var(--dsw-alias-link,#4176e6);clip-path:inset(0 100% 0 0)}
+.wyym-dockLine.is-idle{color:var(--dsw-alias-label-secondary)}
 /* Spectrum strip: a filled area rather than a bare line, pinned to the right edge.
    Wide enough to actually read as a spectrum, and fluid so it takes more room on
    a wide composer without ever pushing into the lyric column. */
-.nenm-dockPulse{position:relative;display:flex;align-items:center;justify-content:center;flex:0 1 auto;width:clamp(88px,11%,150px);min-width:64px;height:30px;overflow:hidden}
-.nenm-dockPulseSvg{position:relative;display:block;width:100%;height:28px}
-.nenm-dockPulseArea{fill:var(--dsw-alias-brand-primary);opacity:.5;stroke:none}
-.nenm-dockPulse[data-playing=false] .nenm-dockPulseArea{opacity:.22}
+.wyym-dockPulse{position:relative;display:flex;align-items:center;justify-content:center;flex:0 1 auto;width:clamp(88px,11%,150px);min-width:64px;height:30px;overflow:hidden}
+.wyym-dockPulseCanvas{position:relative;display:block;width:100%;height:28px;color:var(--dsw-alias-brand-primary);opacity:.5}
+.wyym-dockPulse[data-playing=false] .wyym-dockPulseCanvas{opacity:.22}
 @media (prefers-reduced-motion:reduce){
-/* Must beat .nenm-dock[data-open=...] (specificity 0,2,0), which is where the
-   open/close transitions are declared — a bare .nenm-dock here is 0,1,0 and loses. */
-.nenm-dock[data-open=true],.nenm-dock[data-open=false]{transition:none}
-.nenm-dockLine-enter{animation:none}
-div:has(> * > .nenm-dock) [data-composer-card=true],
-div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:none}
+/* Must beat .wyym-dock[data-open=...] (specificity 0,2,0), which is where the
+   open/close transitions are declared — a bare .wyym-dock here is 0,1,0 and loses. */
+.wyym-dock[data-open=true],.wyym-dock[data-open=false]{transition:none}
+.wyym-dockLine-enter{animation:none}
+div:has(> * > .wyym-dock) [data-composer-card=true],
+div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:none}
 }
 /* On a narrow strip only the decorative cover steps aside. The title/artist stay:
    they are one of the three modules the strip is made of, and dropping them would
    leave the lyric sharing the row with nothing. A long title already truncates
    with an ellipsis inside its own column, and the lyric column wraps, so the three
    modules stay separate at every width (measured down to 340px: no overlap). */
-@media (max-width:720px){.nenm-dockCover{display:none}}
-.nenm-grow{flex:1 1 auto;min-width:0}
-.nenm-scroll{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
-.nenm-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:4px 9px;min-height:26px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;cursor:pointer;white-space:nowrap}
-.nenm-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-btn:disabled{opacity:.5;cursor:default}
-.nenm-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
-.nenm-iconbtn{padding:0;width:28px;height:28px;min-height:28px;border-color:transparent;background:transparent}
-.nenm-iconbtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-iconbtn.is-on{color:var(--dsw-alias-brand-primary)}
-.nenm-fbtn{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:36px;height:36px;min-height:36px;padding:0;border:1px solid transparent;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;transition:background-color .12s,color .12s}
-.nenm-fbtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-.nenm-fbtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
-.nenm-fbtn.is-on{color:var(--dsw-alias-brand-primary)}
-@media (prefers-reduced-motion:reduce){.nenm-fbtn{transition:none}}
-.nenm-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-weight:600}
-.nenm-primary:hover:not(:disabled){background:var(--dsw-alias-brand-primary);opacity:.88}
-.nenm-play{width:38px;height:38px;min-height:38px;border-radius:50%;padding:0;border-color:transparent;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
-.nenm-play:hover:not(:disabled){opacity:.88;background:var(--dsw-alias-brand-primary)}
-.nenm-seg{display:flex;gap:2px;padding:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
-.nenm-seg>button{flex:1 1 0;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;padding:3px 6px;border-radius:6px;cursor:pointer}
-.nenm-seg>button[aria-selected=true]{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary);font-weight:600}
-.nenm-seg>button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.nenm-input,.nenm-select{width:100%;min-height:28px;padding:3px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit}
-.nenm-select{cursor:pointer}
-.nenm-input:focus-visible,.nenm-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.nenm-textarea{width:100%;min-height:56px;resize:vertical;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit}
-.nenm-card{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:10px}
-.nenm-now{display:flex;gap:10px;align-items:center;flex:0 0 auto;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
-.nenm-cover{width:46px;height:46px;border-radius:8px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
-.nenm-cover-sm{width:38px;height:38px;border-radius:6px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
-.nenm-cover-lg{width:64px;height:64px;border-radius:10px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
-.nenm-title{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.nenm-sub{font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
-.nenm-list{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none}
-.nenm-item{display:flex;align-items:center;gap:8px;width:100%;padding:5px 6px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.nenm-item:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-item:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
-.nenm-item[data-active=true]{background:var(--dsw-alias-bg-multi-select);color:var(--dsw-alias-brand-primary)}
-.nenm-item[disabled]{opacity:.55;cursor:default}
-.nenm-index{width:22px;flex:0 0 auto;text-align:right;font-size:11px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
-.nenm-range{width:100%;height:16px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
-.nenm-range:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
-.nenm-banner{display:flex;align-items:flex-start;gap:6px;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;font-size:12px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2)}
-.nenm-banner[data-kind=error]{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
-.nenm-banner[data-kind=ok]{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
-.nenm-badge{display:inline-block;padding:0 4px;border-radius:4px;border:1px solid var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);font-size:10px;line-height:15px;vertical-align:middle}
-.nenm-tag{font-size:10px;padding:0 4px;border-radius:4px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
-.nenm-empty{padding:22px 10px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary)}
-.nenm-head{display:flex;align-items:center;gap:8px}
-.nenm-account{position:relative;display:flex;min-width:0}
-.nenm-accountBtn{display:flex;align-items:center;gap:6px;min-width:0;max-width:196px;padding:3px 6px;border:1px solid transparent;border-radius:8px;background:transparent;color:inherit;font:inherit;cursor:pointer}
-.nenm-accountBtn:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-accountBtn[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-accountBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.nenm-accountBtn .nenm-chevron{transform:rotate(90deg);transition:transform .14s;color:var(--dsw-alias-label-secondary)}
-.nenm-accountBtn[aria-expanded=true] .nenm-chevron{transform:rotate(-90deg)}
-.nenm-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:30;min-width:238px;max-width:280px;padding:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-shadow-lv3)}
-.nenm-menuTitle{padding:4px 8px 6px;font-size:11px;color:var(--dsw-alias-label-secondary)}
-.nenm-menuItem{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.nenm-menuItem:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-menuItem.is-active{background:var(--dsw-alias-interactive-bg-hover)}
-.nenm-menuItem:disabled{cursor:default}
-.nenm-menuItem:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
-.nenm-menuAvatar{width:22px;height:22px;border-radius:50%;object-fit:cover;flex:0 0 auto;background:var(--dsw-alias-bg-layer-2)}
-.nenm-menuSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l1)}
-.nenm-menuNote{padding:4px 8px 2px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary)}
-.nenm-overlay{position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--dsw-alias-bg-mask-1)}
-.nenm-modal{display:flex;flex-direction:column;gap:10px;width:100%;max-width:340px;max-height:100%;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-shadow-lv3)}
-.nenm-avatar{width:22px;height:22px;border-radius:50%;object-fit:cover;background:var(--dsw-alias-bg-layer-2)}
-.nenm-spin{animation:nenm-spin 1s linear infinite}
-@keyframes nenm-spin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion:reduce){.nenm-spin{animation:none}}
+@media (max-width:720px){.wyym-dockCover{display:none}}
+.wyym-grow{flex:1 1 auto;min-width:0}
+.wyym-scroll{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -4px;padding:0 4px}
+.wyym-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:4px 9px;min-height:26px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;cursor:pointer;white-space:nowrap}
+.wyym-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-btn:disabled{opacity:.5;cursor:default}
+.wyym-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.wyym-iconbtn{padding:0;width:28px;height:28px;min-height:28px;border-color:transparent;background:transparent}
+.wyym-iconbtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-iconbtn.is-on{color:var(--dsw-alias-brand-primary)}
+.wyym-fbtn{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:36px;height:36px;min-height:36px;padding:0;border:1px solid transparent;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;transition:background-color .12s,color .12s}
+.wyym-fbtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.wyym-fbtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.wyym-fbtn.is-on{color:var(--dsw-alias-brand-primary)}
+@media (prefers-reduced-motion:reduce){.wyym-fbtn{transition:none}}
+.wyym-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-weight:600}
+.wyym-primary:hover:not(:disabled){background:var(--dsw-alias-brand-primary);opacity:.88}
+.wyym-play{width:38px;height:38px;min-height:38px;border-radius:50%;padding:0;border-color:transparent;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.wyym-play:hover:not(:disabled){opacity:.88;background:var(--dsw-alias-brand-primary)}
+.wyym-seg{display:flex;gap:2px;padding:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
+.wyym-seg>button{flex:1 1 0;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;padding:3px 6px;border-radius:6px;cursor:pointer}
+.wyym-seg>button[aria-selected=true]{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary);font-weight:600}
+.wyym-seg>button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.wyym-input,.wyym-select{width:100%;min-height:28px;padding:3px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit}
+.wyym-select{cursor:pointer}
+.wyym-input:focus-visible,.wyym-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.wyym-textarea{width:100%;min-height:56px;resize:vertical;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit}
+.wyym-card{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);padding:10px}
+.wyym-now{display:flex;gap:10px;align-items:center;flex:0 0 auto;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
+.wyym-cover{width:46px;height:46px;border-radius:8px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
+.wyym-cover-sm{width:38px;height:38px;border-radius:6px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
+.wyym-cover-lg{width:64px;height:64px;border-radius:10px;flex:0 0 auto;object-fit:cover;background:var(--dsw-alias-bg-layer-2);display:block}
+.wyym-title{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wyym-sub{font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.wyym-list{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none}
+.wyym-item{display:flex;align-items:center;gap:8px;width:100%;padding:5px 6px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.wyym-item:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-item:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.wyym-item[data-active=true]{background:var(--dsw-alias-bg-multi-select);color:var(--dsw-alias-brand-primary)}
+.wyym-item[disabled]{opacity:.55;cursor:default}
+.wyym-index{width:22px;flex:0 0 auto;text-align:right;font-size:11px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+.wyym-range{width:100%;height:16px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
+.wyym-range:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.wyym-banner{display:flex;align-items:flex-start;gap:6px;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;font-size:12px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2)}
+.wyym-banner[data-kind=error]{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.wyym-banner[data-kind=ok]{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
+.wyym-badge{display:inline-block;padding:0 4px;border-radius:4px;border:1px solid var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);font-size:10px;line-height:15px;vertical-align:middle}
+.wyym-tag{font-size:10px;padding:0 4px;border-radius:4px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
+.wyym-empty{padding:22px 10px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.wyym-head{display:flex;align-items:center;gap:8px}
+.wyym-account{position:relative;display:flex;min-width:0}
+.wyym-accountBtn{display:flex;align-items:center;gap:6px;min-width:0;max-width:196px;padding:3px 6px;border:1px solid transparent;border-radius:8px;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.wyym-accountBtn:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-accountBtn[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-accountBtn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.wyym-accountBtn .wyym-chevron{transform:rotate(90deg);transition:transform .14s;color:var(--dsw-alias-label-secondary)}
+.wyym-accountBtn[aria-expanded=true] .wyym-chevron{transform:rotate(-90deg)}
+.wyym-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:30;min-width:238px;max-width:280px;padding:6px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-shadow-lv3)}
+.wyym-menuTitle{padding:4px 8px 6px;font-size:11px;color:var(--dsw-alias-label-secondary)}
+.wyym-menuItem{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.wyym-menuItem:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-menuItem.is-active{background:var(--dsw-alias-interactive-bg-hover)}
+.wyym-menuItem:disabled{cursor:default}
+.wyym-menuItem:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.wyym-menuAvatar{width:22px;height:22px;border-radius:50%;object-fit:cover;flex:0 0 auto;background:var(--dsw-alias-bg-layer-2)}
+.wyym-menuSep{height:1px;margin:5px 4px;background:var(--dsw-alias-border-l1)}
+.wyym-menuNote{padding:4px 8px 2px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary)}
+.wyym-overlay{position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--dsw-alias-bg-mask-1)}
+.wyym-modal{display:flex;flex-direction:column;gap:10px;width:100%;max-width:340px;max-height:100%;overflow:auto;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1);box-shadow:var(--dsw-shadow-lv3)}
+.wyym-avatar{width:22px;height:22px;border-radius:50%;object-fit:cover;background:var(--dsw-alias-bg-layer-2)}
+.wyym-spin{animation:wyym-spin 1s linear infinite}
+@keyframes wyym-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.wyym-spin{animation:none}}
 `;
 
     // ------------------------------------------------------------------ store --
@@ -1410,13 +1415,13 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
     function Banner({ kind, children, onClose }) {
       return h(
         'div',
-        { className: 'nenm-banner', 'data-kind': kind || 'info', role: kind === 'error' ? 'alert' : 'status' },
+        { className: 'wyym-banner', 'data-kind': kind || 'info', role: kind === 'error' ? 'alert' : 'status' },
         h(Icon, { d: GLYPH.alert.d, size: 14, style: { flex: '0 0 auto', marginTop: '1px' } }),
-        h('span', { className: 'nenm-grow' }, children),
+        h('span', { className: 'wyym-grow' }, children),
         onClose
           ? h(
               'button',
-              { type: 'button', className: 'nenm-btn nenm-iconbtn', onClick: onClose, 'aria-label': 'dismiss' },
+              { type: 'button', className: 'wyym-btn wyym-iconbtn', onClick: onClose, 'aria-label': 'dismiss' },
               h('span', { 'aria-hidden': 'true' }, '×'),
             )
           : null,
@@ -1440,26 +1445,26 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
       const actual = state.actualLevel ? LEVEL_LABEL[state.actualLevel] : '';
       return h(
         'div',
-        { className: 'nenm-player' },
+        { className: 'wyym-player' },
         h(
           'div',
-          { className: 'nenm-now' },
+          { className: 'wyym-now' },
           track && track.cover
-            ? h('img', { className: 'nenm-cover', src: track.cover, alt: '', loading: 'lazy' })
-            : h('div', { className: 'nenm-cover', 'aria-hidden': 'true' }),
+            ? h('img', { className: 'wyym-cover', src: track.cover, alt: '', loading: 'lazy' })
+            : h('div', { className: 'wyym-cover', 'aria-hidden': 'true' }),
           h(
             'div',
-            { className: 'nenm-grow' },
-            h('div', { className: 'nenm-title' }, track ? track.name : t('nothingPlaying')),
-            h('div', { className: 'nenm-sub' }, track ? track.artists : t('hintPlay')),
-            track && track.album ? h('div', { className: 'nenm-sub nenm-faint' }, track.album) : null,
+            { className: 'wyym-grow' },
+            h('div', { className: 'wyym-title' }, track ? track.name : t('nothingPlaying')),
+            h('div', { className: 'wyym-sub' }, track ? track.artists : t('hintPlay')),
+            track && track.album ? h('div', { className: 'wyym-sub wyym-faint' }, track.album) : null,
           ),
           state.loading
-            ? h(Icon, { d: GLYPH.refresh.d, size: 14, className: 'nenm-spin', style: { flex: '0 0 auto' } })
+            ? h(Icon, { d: GLYPH.refresh.d, size: 14, className: 'wyym-spin', style: { flex: '0 0 auto' } })
             : null,
         ),
         h('input', {
-          className: 'nenm-range',
+          className: 'wyym-range',
           type: 'range',
           min: 0,
           max: Math.max(1, Math.round(duration)),
@@ -1471,23 +1476,23 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         }),
         h(
           'div',
-          { className: 'nenm-row' },
-          h('span', { className: 'nenm-faint', style: { fontVariantNumeric: 'tabular-nums' } }, formatTime(state.position)),
-          h('span', { className: 'nenm-grow' }),
+          { className: 'wyym-row' },
+          h('span', { className: 'wyym-faint', style: { fontVariantNumeric: 'tabular-nums' } }, formatTime(state.position)),
+          h('span', { className: 'wyym-grow' }),
           h(
             'span',
-            { className: 'nenm-faint', style: { fontVariantNumeric: 'tabular-nums' } },
+            { className: 'wyym-faint', style: { fontVariantNumeric: 'tabular-nums' } },
             actual && state.actualBr ? `${actual} · ${Math.round(state.actualBr / 1000)}kbps` : formatTime(duration),
           ),
         ),
         h(
           'div',
-          { className: 'nenm-row' },
+          { className: 'wyym-row' },
           h(
             'button',
             {
               type: 'button',
-              className: 'nenm-btn nenm-iconbtn',
+              className: 'wyym-btn wyym-iconbtn',
               title: `${t('mode')}：${modeLabel}`,
               onClick: () => {
                 const index = MODES.indexOf(modeId);
@@ -1497,18 +1502,18 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
             },
             h(ModeIcon, { mode: state.mode, size: 16 }),
           ),
-          h('span', { className: 'nenm-faint', style: { fontSize: '11px' } }, modeLabel),
-          h('span', { className: 'nenm-grow' }),
+          h('span', { className: 'wyym-faint', style: { fontSize: '11px' } }, modeLabel),
+          h('span', { className: 'wyym-grow' }),
           h(
             'button',
-            { type: 'button', className: 'nenm-btn nenm-iconbtn', onClick: player.prev, title: t('prev'), 'aria-label': t('prev') },
+            { type: 'button', className: 'wyym-btn wyym-iconbtn', onClick: player.prev, title: t('prev'), 'aria-label': t('prev') },
             h(Icon, { d: GLYPH.prev.d, size: 16 }),
           ),
           h(
             'button',
             {
               type: 'button',
-              className: 'nenm-btn nenm-play',
+              className: 'wyym-btn wyym-play',
               onClick: player.toggle,
               title: state.playing ? t('pause') : t('play'),
               'aria-label': state.playing ? t('pause') : t('play'),
@@ -1518,16 +1523,16 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           ),
           h(
             'button',
-            { type: 'button', className: 'nenm-btn nenm-iconbtn', onClick: player.next, title: t('next'), 'aria-label': t('next') },
+            { type: 'button', className: 'wyym-btn wyym-iconbtn', onClick: player.next, title: t('next'), 'aria-label': t('next') },
             h(Icon, { d: GLYPH.next.d, size: 16 }),
           ),
-          h('span', { className: 'nenm-grow' }),
+          h('span', { className: 'wyym-grow' }),
           h(
             'label',
-            { className: 'nenm-row', style: { gap: '4px' }, title: t('volume') },
+            { className: 'wyym-row', style: { gap: '4px' }, title: t('volume') },
             h(Icon, { d: GLYPH.volume.d, size: 15 }),
             h('input', {
-              className: 'nenm-range',
+              className: 'wyym-range',
               style: { width: '58px' },
               type: 'range',
               min: 0,
@@ -1543,10 +1548,10 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         // left the switch floating below the name instead of level with it.
         h(
           'div',
-          { className: 'nenm-playerFoot' },
+          { className: 'wyym-playerFoot' },
           h(
             'span',
-            { className: 'nenm-faint nenm-grow', style: { fontSize: '11px', minWidth: '0' } },
+            { className: 'wyym-faint wyym-grow', style: { fontSize: '11px', minWidth: '0' } },
             state.queue.length > 1
               ? [
                   t('nowPlayingCount', { index: state.index + 1, total: state.queue.length }),
@@ -1558,91 +1563,173 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           ),
           h(
             'label',
-            { className: 'nenm-switch', title: t('dockToggle') },
-            h('span', { className: 'nenm-switchLabel' }, t('dockToggle')),
+            { className: 'wyym-switch', title: t('dockToggle') },
+            h('span', { className: 'wyym-switchLabel' }, t('dockToggle')),
             h('input', {
               type: 'checkbox',
-              className: 'nenm-switchInput',
+              className: 'wyym-switchInput',
               checked: state.dock,
               onChange: (event) => player.setDock(event.target.checked),
               'aria-label': t('dockToggle'),
             }),
-            h('span', { className: 'nenm-switchTrack', 'aria-hidden': 'true' }, h('span', { className: 'nenm-switchKnob' })),
+            h('span', { className: 'wyym-switchTrack', 'aria-hidden': 'true' }, h('span', { className: 'wyym-switchKnob' })),
           ),
         ),
       );
     }
 
-    function TrackList({ store, player, tracks, origin }) {
-      const state = useStore(store);
+    /**
+     * Row pitch of a track row: the row box plus the list's 2px flex gap. Fixed,
+     * so the rendered window can be computed without measuring each row.
+     */
+    const TRACK_ROW_PITCH = 50;
+    /** Lists longer than this are windowed; shorter ones render whole. */
+    const TRACK_WINDOW_MIN = 200;
+    /** Extra rows kept mounted beyond the viewport so scrolling shows no blank band. */
+    const TRACK_OVERSCAN = 8;
+
+    /**
+     * The track rows, windowed and memoised.
+     *
+     * Why both: the player commits `position` once per second so the progress bar
+     * stays honest, and this list used to subscribe to the whole store and render
+     * every row. On a 3460-track playlist that is ~29k DOM nodes, and with that
+     * much DOM the once-per-second update cost a ~300ms style/layout pass — one
+     * frozen frame per second, which is what made the dock's spectrum stutter on
+     * tracks like Blue Planet. Measured on this machine, same playback: 3460 rows
+     * 48fps with 15 frozen frames per 15s; 300 rows 60fps with none. So the rows
+     * now arrive as props (primitives, keeping `React.memo` stable across a
+     * position tick) and only the visible slice is mounted.
+     *
+     * `originId`/`originName` are passed as primitives for the same reason: an
+     * inline `{ playlistId, playlistName }` object would be a fresh reference on
+     * every parent render and defeat the memo.
+     */
+    const TrackList = React.memo(function TrackList({ player, tracks, originId, originName, currentId, playing }) {
+      const origin = useMemo(() => ({ playlistId: originId, playlistName: originName }), [originId, originName]);
+      const rootRef = useRef(null);
+      const windowed = tracks.length > TRACK_WINDOW_MIN;
+      const [slice, setSlice] = useState(() => ({
+        from: 0,
+        to: windowed ? TRACK_WINDOW_MIN : tracks.length,
+      }));
+
+      useEffect(() => {
+        if (!windowed) {
+          setSlice((prev) => (prev.from === 0 && prev.to === tracks.length ? prev : { from: 0, to: tracks.length }));
+          return undefined;
+        }
+        const root = rootRef.current;
+        const scroller = root && root.parentElement;
+        if (!scroller) return undefined;
+        let frame = 0;
+        const measure = () => {
+          frame = 0;
+          const height = scroller.clientHeight || 360;
+          const top = scroller.scrollTop || 0;
+          const from = Math.max(0, Math.floor(top / TRACK_ROW_PITCH) - TRACK_OVERSCAN);
+          const count = Math.ceil(height / TRACK_ROW_PITCH) + TRACK_OVERSCAN * 2;
+          const to = Math.min(tracks.length, from + count);
+          setSlice((prev) => (prev.from === from && prev.to === to ? prev : { from, to }));
+        };
+        const onScroll = () => {
+          if (!frame) frame = window.requestAnimationFrame(measure);
+        };
+        measure();
+        scroller.addEventListener('scroll', onScroll, { passive: true });
+        let observer = null;
+        if (typeof ResizeObserver !== 'undefined') {
+          observer = new ResizeObserver(onScroll);
+          observer.observe(scroller);
+        }
+        return () => {
+          scroller.removeEventListener('scroll', onScroll);
+          if (observer) observer.disconnect();
+          if (frame) window.cancelAnimationFrame(frame);
+        };
+      }, [tracks, windowed]);
+
+      const from = Math.min(slice.from, Math.max(0, tracks.length - 1));
+      const to = Math.max(from, Math.min(slice.to, tracks.length));
+      const rows = tracks.slice(from, to);
+      // Spacer padding keeps the scrollbar honest: the rows above and below the
+      // window still occupy their height without being mounted.
+      const spacer = windowed
+        ? {
+            paddingTop: `${from * TRACK_ROW_PITCH}px`,
+            paddingBottom: `${Math.max(0, tracks.length - to) * TRACK_ROW_PITCH}px`,
+          }
+        : undefined;
+      const rowStyle = windowed ? { height: `${TRACK_ROW_PITCH - 2}px` } : undefined;
       const start = (index) => player.playQueue(tracks, index, origin);
       return h(
         'div',
-        { className: 'nenm-col' },
+        { className: 'wyym-col', ref: rootRef },
         h(
           'ul',
-          { className: 'nenm-list' },
-          tracks.map((track, index) =>
-            h(
+          { className: 'wyym-list', style: spacer },
+          rows.map((track, offset) => {
+            const index = from + offset;
+            return h(
               'li',
-              { key: `${track.id}-${index}` },
+              { key: `${track.id}-${index}`, style: rowStyle },
               h(
                 'button',
                 {
                   type: 'button',
-                  className: 'nenm-item',
-                  'data-active': state.current && state.current.id === track.id,
+                  className: 'wyym-item',
+                  'data-active': currentId === track.id,
                   onClick: () => start(index),
                 },
-                h('span', { className: 'nenm-index' }, state.current && state.current.id === track.id && state.playing ? '♪' : index + 1),
+                h('span', { className: 'wyym-index' }, currentId === track.id && playing ? '♪' : index + 1),
                 // Every NetEase track carries its album art (al.picUrl), so the list shows it
                 // like the playlist rows do. lazy+async keeps a long list cheap to paint.
                 track.cover
-                  ? h('img', { className: 'nenm-cover-sm', src: track.cover, alt: '', loading: 'lazy', decoding: 'async' })
-                  : h('div', { className: 'nenm-cover-sm', 'aria-hidden': 'true' }),
+                  ? h('img', { className: 'wyym-cover-sm', src: track.cover, alt: '', loading: 'lazy', decoding: 'async' })
+                  : h('div', { className: 'wyym-cover-sm', 'aria-hidden': 'true' }),
                 h(
                   'span',
-                  { className: 'nenm-grow' },
-                  h('span', { className: 'nenm-title', style: { display: 'block' } }, track.name),
-                  h('span', { className: 'nenm-sub', style: { display: 'block' } }, `${track.artists}${track.album ? ` · ${track.album}` : ''}`),
+                  { className: 'wyym-grow' },
+                  h('span', { className: 'wyym-title', style: { display: 'block' } }, track.name),
+                  h('span', { className: 'wyym-sub', style: { display: 'block' } }, `${track.artists}${track.album ? ` · ${track.album}` : ''}`),
                 ),
-                track.noCopyright ? h('span', { className: 'nenm-tag' }, t('noCopyright')) : null,
-                track.fee === 1 ? h('span', { className: 'nenm-badge' }, 'VIP') : null,
-                h('span', { className: 'nenm-index' }, formatTime(track.duration / 1000)),
+                track.noCopyright ? h('span', { className: 'wyym-tag' }, t('noCopyright')) : null,
+                track.fee === 1 ? h('span', { className: 'wyym-badge' }, 'VIP') : null,
+                h('span', { className: 'wyym-index' }, formatTime(track.duration / 1000)),
               ),
-            ),
-          ),
+            );
+          }),
         ),
       );
-    }
+    });
 
     function PlaylistList({ store, player, playlists }) {
-      if (!playlists.length) return h('div', { className: 'nenm-empty' }, t('emptyPlaylists'));
+      if (!playlists.length) return h('div', { className: 'wyym-empty' }, t('emptyPlaylists'));
       return h(
         'ul',
-        { className: 'nenm-list' },
+        { className: 'wyym-list' },
         playlists.map((playlist) =>
           h(
             'li',
             { key: playlist.id },
             h(
               'button',
-              { type: 'button', className: 'nenm-item', onClick: () => void openPlaylist(store, player, playlist) },
+              { type: 'button', className: 'wyym-item', onClick: () => void openPlaylist(store, player, playlist) },
               playlist.cover
-                ? h('img', { className: 'nenm-cover-sm', src: playlist.cover, alt: '', loading: 'lazy' })
-                : h('div', { className: 'nenm-cover-sm', 'aria-hidden': 'true' }),
+                ? h('img', { className: 'wyym-cover-sm', src: playlist.cover, alt: '', loading: 'lazy' })
+                : h('div', { className: 'wyym-cover-sm', 'aria-hidden': 'true' }),
               h(
                 'span',
-                { className: 'nenm-grow' },
-                h('span', { className: 'nenm-title', style: { display: 'block' } }, playlist.name),
+                { className: 'wyym-grow' },
+                h('span', { className: 'wyym-title', style: { display: 'block' } }, playlist.name),
                 h(
                   'span',
-                  { className: 'nenm-sub', style: { display: 'block' } },
+                  { className: 'wyym-sub', style: { display: 'block' } },
                   t('songs', { count: playlist.trackCount }),
                   playlist.creator ? ` · ${t('createdBy', { name: playlist.creator })}` : '',
                 ),
               ),
-              playlist.specialType === 5 ? h('span', { className: 'nenm-badge' }, '♥') : null,
+              playlist.specialType === 5 ? h('span', { className: 'wyym-badge' }, '♥') : null,
               h(Icon, { d: GLYPH.chevron.d, size: 15 }),
             ),
           ),
@@ -1672,12 +1759,12 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
       };
       return h(
         'div',
-        { className: 'nenm-col', style: { flex: '1 1 auto', minHeight: 0 } },
+        { className: 'wyym-col', style: { flex: '1 1 auto', minHeight: 0 } },
         h(
           'form',
-          { className: 'nenm-row', onSubmit: submit },
+          { className: 'wyym-row', onSubmit: submit },
           h('input', {
-            className: 'nenm-input',
+            className: 'wyym-input',
             value: keywords,
             placeholder: t('searchPlaceholder'),
             onChange: (event) => setKeywords(event.target.value),
@@ -1685,13 +1772,13 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           }),
           h(
             'button',
-            { type: 'submit', className: 'nenm-btn nenm-primary', disabled: busy },
-            h(Icon, { d: busy ? GLYPH.refresh.d : GLYPH.search.d, size: 15, className: busy ? 'nenm-spin' : '' }),
+            { type: 'submit', className: 'wyym-btn wyym-primary', disabled: busy },
+            h(Icon, { d: busy ? GLYPH.refresh.d : GLYPH.search.d, size: 15, className: busy ? 'wyym-spin' : '' }),
           ),
         ),
         h(
           'div',
-          { className: 'nenm-seg', role: 'tablist' },
+          { className: 'wyym-seg', role: 'tablist' },
           [1, 1000, 100].map((value) =>
             h(
               'button',
@@ -1710,14 +1797,16 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         // overflowed the host's overflow:hidden pane and the tail was unreachable.
         h(
           'div',
-          { className: 'nenm-scroll' },
-          busy ? h('div', { className: 'nenm-empty' }, t('searching')) : null,
+          { className: 'wyym-scroll' },
+          busy ? h('div', { className: 'wyym-empty' }, t('searching')) : null,
           !busy && result && result.kind === 'song' && result.tracks.length
             ? h(TrackList, {
-                store,
                 player,
                 tracks: result.tracks,
-                origin: { playlistId: null, playlistName: t('search') },
+                originId: null,
+                originName: t('search'),
+                currentId: state.current ? state.current.id : null,
+                playing: state.playing,
               })
             : null,
           !busy && result && result.kind === 'playlist' && result.playlists.length
@@ -1726,7 +1815,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           !busy && result && result.kind === 'artist' && result.artists.length
             ? h(
                 'ul',
-                { className: 'nenm-list' },
+                { className: 'wyym-list' },
                 result.artists.map((artist) =>
                   h(
                     'li',
@@ -1735,7 +1824,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                       'button',
                       {
                         type: 'button',
-                        className: 'nenm-item',
+                        className: 'wyym-item',
                         onClick: async () => {
                           const text = artist.name;
                           setKeywords(text);
@@ -1751,8 +1840,8 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                           }
                         },
                       },
-                      artist.cover ? h('img', { className: 'nenm-cover-sm', src: artist.cover, alt: '', loading: 'lazy' }) : null,
-                      h('span', { className: 'nenm-grow nenm-title' }, artist.name),
+                      artist.cover ? h('img', { className: 'wyym-cover-sm', src: artist.cover, alt: '', loading: 'lazy' }) : null,
+                      h('span', { className: 'wyym-grow wyym-title' }, artist.name),
                       h(Icon, { d: GLYPH.chevron.d, size: 15 }),
                     ),
                   ),
@@ -1760,7 +1849,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               )
             : null,
           !busy && result && !((result.tracks && result.tracks.length) || (result.playlists && result.playlists.length) || (result.artists && result.artists.length))
-            ? h('div', { className: 'nenm-empty' }, t('searchEmpty'))
+            ? h('div', { className: 'wyym-empty' }, t('searchEmpty'))
             : null,
         ),
       );
@@ -1833,10 +1922,10 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
 
       return h(
         'div',
-        { className: 'nenm-col' },
+        { className: 'wyym-col' },
         h(
           'div',
-          { className: 'nenm-seg', role: 'tablist' },
+          { className: 'wyym-seg', role: 'tablist' },
           [
             ['phone', t('loginPhone')],
             ['cookie', t('loginCookie')],
@@ -1848,9 +1937,9 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         method === 'phone'
           ? h(
               'form',
-              { className: 'nenm-col', onSubmit: submitPhone },
+              { className: 'wyym-col', onSubmit: submitPhone },
               h('input', {
-                className: 'nenm-input',
+                className: 'wyym-input',
                 value: phone,
                 inputMode: 'tel',
                 placeholder: t('phone'),
@@ -1860,9 +1949,9 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               useCaptcha
                 ? h(
                     'div',
-                    { className: 'nenm-row' },
+                    { className: 'wyym-row' },
                     h('input', {
-                      className: 'nenm-input',
+                      className: 'wyym-input',
                       value: captcha,
                       inputMode: 'numeric',
                       placeholder: t('captcha'),
@@ -1871,12 +1960,12 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                     }),
                     h(
                       'button',
-                      { type: 'button', className: 'nenm-btn', disabled: busy || countdown > 0, onClick: sendCaptcha },
+                      { type: 'button', className: 'wyym-btn', disabled: busy || countdown > 0, onClick: sendCaptcha },
                       countdown > 0 ? t('resendIn', { seconds: countdown }) : t('sendCaptcha'),
                     ),
                   )
                 : h('input', {
-                    className: 'nenm-input',
+                    className: 'wyym-input',
                     value: password,
                     type: 'password',
                     placeholder: t('password'),
@@ -1885,12 +1974,12 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                   }),
               h(
                 'button',
-                { type: 'submit', className: 'nenm-btn nenm-primary', style: { justifyContent: 'center' }, disabled: busy },
+                { type: 'submit', className: 'wyym-btn wyym-primary', style: { justifyContent: 'center' }, disabled: busy },
                 busy ? t('loggingIn') : t('submit'),
               ),
               h(
                 'button',
-                { type: 'button', className: 'nenm-btn', style: { justifyContent: 'center' }, onClick: () => setUseCaptcha(!useCaptcha) },
+                { type: 'button', className: 'wyym-btn', style: { justifyContent: 'center' }, onClick: () => setUseCaptcha(!useCaptcha) },
                 useCaptcha ? t('byPassword') : t('byCaptcha'),
               ),
             )
@@ -1898,10 +1987,10 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         method === 'cookie'
           ? h(
               'form',
-              { className: 'nenm-col', onSubmit: submitCookie },
-              h('div', { className: 'nenm-faint', style: { fontSize: '11.5px' } }, t('cookieHint')),
+              { className: 'wyym-col', onSubmit: submitCookie },
+              h('div', { className: 'wyym-faint', style: { fontSize: '11.5px' } }, t('cookieHint')),
               h('textarea', {
-                className: 'nenm-textarea',
+                className: 'wyym-textarea',
                 value: cookie,
                 placeholder: t('cookiePlaceholder'),
                 onChange: (event) => setCookie(event.target.value),
@@ -1909,7 +1998,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               }),
               h(
                 'button',
-                { type: 'submit', className: 'nenm-btn nenm-primary', style: { justifyContent: 'center' }, disabled: busy },
+                { type: 'submit', className: 'wyym-btn wyym-primary', style: { justifyContent: 'center' }, disabled: busy },
                 busy ? t('loggingIn') : t('submit'),
               ),
             )
@@ -1942,7 +2031,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         if (!menuOpen) return undefined;
         const onDown = (event) => {
           const node = event.target;
-          if (node && typeof node.closest === 'function' && node.closest('.nenm-account')) return;
+          if (node && typeof node.closest === 'function' && node.closest('.wyym-account')) return;
           setMenuOpen(false);
         };
         document.addEventListener('pointerdown', onDown, true);
@@ -2028,8 +2117,8 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
 
       const accountMenu = h(
         'div',
-        { className: 'nenm-menu', role: 'menu', 'aria-label': t('accounts') },
-        h('div', { className: 'nenm-menuTitle' }, t('accounts')),
+        { className: 'wyym-menu', role: 'menu', 'aria-label': t('accounts') },
+        h('div', { className: 'wyym-menuTitle' }, t('accounts')),
         accountList.map((account) =>
           h(
             'button',
@@ -2038,54 +2127,54 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               type: 'button',
               role: 'menuitemradio',
               'aria-checked': Boolean(account.active),
-              className: account.active ? 'nenm-menuItem is-active' : 'nenm-menuItem',
+              className: account.active ? 'wyym-menuItem is-active' : 'wyym-menuItem',
               disabled: Boolean(account.active),
               onClick: () => void switchTo(account.userId),
             },
             account.avatarUrl
-              ? h('img', { className: 'nenm-menuAvatar', src: account.avatarUrl, alt: '', loading: 'lazy' })
+              ? h('img', { className: 'wyym-menuAvatar', src: account.avatarUrl, alt: '', loading: 'lazy' })
               : h(Icon, { d: GLYPH.user.d, size: 15 }),
-            h('span', { className: 'nenm-grow nenm-title' }, account.nickname || t('nickFallback')),
-            account.vipLabel ? h('span', { className: 'nenm-badge' }, account.vipLabel) : null,
+            h('span', { className: 'wyym-grow wyym-title' }, account.nickname || t('nickFallback')),
+            account.vipLabel ? h('span', { className: 'wyym-badge' }, account.vipLabel) : null,
             account.active ? h(Icon, { d: GLYPH.check.d, size: 15 }) : null,
           ),
         ),
-        h('div', { className: 'nenm-menuSep' }),
+        h('div', { className: 'wyym-menuSep' }),
         h(
           'button',
           {
             type: 'button',
             role: 'menuitem',
-            className: 'nenm-menuItem',
+            className: 'wyym-menuItem',
             onClick: () => {
               setMenuOpen(false);
               setLoginOpen(true);
             },
           },
           h(Icon, { d: GLYPH.plus.d, size: 15 }),
-          h('span', { className: 'nenm-grow' }, t('addAccount')),
+          h('span', { className: 'wyym-grow' }, t('addAccount')),
         ),
         h(
           'button',
-          { type: 'button', role: 'menuitem', className: 'nenm-menuItem', onClick: () => void logout() },
+          { type: 'button', role: 'menuitem', className: 'wyym-menuItem', onClick: () => void logout() },
           h(Icon, { d: GLYPH.logout.d, size: 15 }),
-          h('span', { className: 'nenm-grow' }, t('logoutCurrent')),
+          h('span', { className: 'wyym-grow' }, t('logoutCurrent')),
         ),
-        accountMenuReady ? null : h('div', { className: 'nenm-menuNote' }, t('accountUnavailable')),
+        accountMenuReady ? null : h('div', { className: 'wyym-menuNote' }, t('accountUnavailable')),
       );
 
       const headerRight = loggedIn
         ? h(
             'div',
-            { className: 'nenm-row', style: { gap: '6px' } },
+            { className: 'wyym-row', style: { gap: '6px' } },
             h(
               'div',
-              { className: 'nenm-account' },
+              { className: 'wyym-account' },
               h(
                 'button',
                 {
                   type: 'button',
-                  className: 'nenm-accountBtn',
+                  className: 'wyym-accountBtn',
                   'aria-haspopup': 'menu',
                   'aria-expanded': menuOpen,
                   'aria-label': t('account'),
@@ -2093,31 +2182,31 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                   onClick: () => setMenuOpen((open) => !open),
                 },
                 state.profile && state.profile.avatarUrl
-                  ? h('img', { className: 'nenm-avatar', src: state.profile.avatarUrl, alt: '' })
+                  ? h('img', { className: 'wyym-avatar', src: state.profile.avatarUrl, alt: '' })
                   : h(Icon, { d: GLYPH.user.d, size: 16 }),
                 h(
                   'span',
-                  { className: 'nenm-sub', style: { maxWidth: '92px' } },
+                  { className: 'wyym-sub', style: { maxWidth: '92px' } },
                   (state.profile && state.profile.nickname) || t('nickFallback'),
                 ),
                 state.profile && state.profile.vipLabel
-                  ? h('span', { className: 'nenm-badge' }, state.profile.vipLabel)
+                  ? h('span', { className: 'wyym-badge' }, state.profile.vipLabel)
                   : null,
-                h(Icon, { d: GLYPH.chevron.d, size: 13, className: 'nenm-chevron' }),
+                h(Icon, { d: GLYPH.chevron.d, size: 13, className: 'wyym-chevron' }),
               ),
               menuOpen ? accountMenu : null,
             ),
           )
         : h(
             'button',
-            { type: 'button', className: 'nenm-btn', onClick: () => setLoginOpen(true) },
+            { type: 'button', className: 'wyym-btn', onClick: () => setLoginOpen(true) },
             h(Icon, { d: GLYPH.user.d, size: 14 }),
             t('login'),
           );
 
       const viewTabs = h(
         'div',
-        { className: 'nenm-seg', role: 'tablist' },
+        { className: 'wyym-seg', role: 'tablist' },
         [
           ['playlists', t('playlists')],
           ['search', t('search')],
@@ -2143,11 +2232,11 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
       if (!loggedIn) {
         body = h(
           'div',
-          { className: 'nenm-col' },
-          h('div', { className: 'nenm-empty' }, t('needLogin')),
+          { className: 'wyym-col' },
+          h('div', { className: 'wyym-empty' }, t('needLogin')),
           h(
             'button',
-            { type: 'button', className: 'nenm-btn nenm-primary', style: { justifyContent: 'center' }, onClick: () => setLoginOpen(true) },
+            { type: 'button', className: 'wyym-btn wyym-primary', style: { justifyContent: 'center' }, onClick: () => setLoginOpen(true) },
             t('goLogin'),
           ),
         );
@@ -2156,23 +2245,23 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
       } else if (view === 'tracks') {
         body = h(
           'div',
-          { className: 'nenm-col' },
+          { className: 'wyym-col' },
           h(
             'div',
-            { className: 'nenm-row' },
+            { className: 'wyym-row' },
             h(
               'button',
-              { type: 'button', className: 'nenm-btn nenm-iconbtn', onClick: () => store.set({ view: 'playlists', playlist: null }), 'aria-label': t('back') },
+              { type: 'button', className: 'wyym-btn wyym-iconbtn', onClick: () => store.set({ view: 'playlists', playlist: null }), 'aria-label': t('back') },
               h(Icon, { d: GLYPH.back.d, size: 16 }),
             ),
             state.playlist
               ? h(
                   'div',
-                  { className: 'nenm-grow' },
-                  h('div', { className: 'nenm-title' }, state.playlist.info.name),
+                  { className: 'wyym-grow' },
+                  h('div', { className: 'wyym-title' }, state.playlist.info.name),
                   h(
                     'div',
-                    { className: 'nenm-sub' },
+                    { className: 'wyym-sub' },
                     t('songs', { count: state.playlist.info.trackCount }),
                     state.playlist.info.creator ? ` · ${state.playlist.info.creator}` : '',
                   ),
@@ -2183,7 +2272,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                   'button',
                   {
                     type: 'button',
-                    className: 'nenm-btn',
+                    className: 'wyym-btn',
                     onClick: () =>
                       player.playQueue(state.playlist.tracks, 0, {
                         playlistId: state.playlist.info.id,
@@ -2196,51 +2285,53 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                 )
               : null,
           ),
-          state.playlistLoading ? h(Icon, { d: GLYPH.refresh.d, size: 18, className: 'nenm-spin' }) : null,
+          state.playlistLoading ? h(Icon, { d: GLYPH.refresh.d, size: 18, className: 'wyym-spin' }) : null,
           state.playlist && state.playlist.tracks.length
-            ? h('div', { className: 'nenm-scroll' }, h(TrackList, {
-                store,
+            ? h('div', { className: 'wyym-scroll' }, h(TrackList, {
                 player,
                 tracks: state.playlist.tracks,
-                origin: { playlistId: state.playlist.info.id, playlistName: state.playlist.info.name },
+                originId: state.playlist.info.id,
+                originName: state.playlist.info.name,
+                currentId: state.current ? state.current.id : null,
+                playing: state.playing,
               }))
             : null,
         );
       } else {
         body = h(
           'div',
-          { className: 'nenm-col' },
+          { className: 'wyym-col' },
           h(
             'div',
-            { className: 'nenm-row' },
-            h('span', { className: 'nenm-title nenm-grow' }, t('myPlaylists')),
+            { className: 'wyym-row' },
+            h('span', { className: 'wyym-title wyym-grow' }, t('myPlaylists')),
             h(
               'button',
               {
                 type: 'button',
-                className: 'nenm-btn nenm-iconbtn',
+                className: 'wyym-btn wyym-iconbtn',
                 title: t('refresh'),
                 'aria-label': t('refresh'),
                 onClick: () => void loadPlaylists(store),
                 disabled: state.playlistsLoading,
               },
-              h(Icon, { d: GLYPH.refresh.d, size: 15, className: state.playlistsLoading ? 'nenm-spin' : '' }),
+              h(Icon, { d: GLYPH.refresh.d, size: 15, className: state.playlistsLoading ? 'wyym-spin' : '' }),
             ),
           ),
           state.playlistsLoading && !state.playlists.length
-            ? h('div', { className: 'nenm-empty' }, h(Icon, { d: GLYPH.refresh.d, size: 18, className: 'nenm-spin' }))
-            : h('div', { className: 'nenm-scroll' }, h(PlaylistList, { store, player, playlists: state.playlists })),
+            ? h('div', { className: 'wyym-empty' }, h(Icon, { d: GLYPH.refresh.d, size: 18, className: 'wyym-spin' }))
+            : h('div', { className: 'wyym-scroll' }, h(PlaylistList, { store, player, playlists: state.playlists })),
         );
       }
 
       return h(
         'div',
-        { className: 'nenm-root' },
+        { className: 'wyym-root' },
         h(
           'div',
-          { className: 'nenm-head' },
+          { className: 'wyym-head' },
           h(Icon, { d: GLYPH.music.d, size: 17 }),
-          h('span', { className: 'nenm-title nenm-grow' }, t('title')),
+          h('span', { className: 'wyym-title wyym-grow' }, t('title')),
           headerRight,
         ),
         // Top of the panel: the 歌单 / 搜索 switch, right under the title.
@@ -2248,7 +2339,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         state.error ? h(Banner, { kind: 'error', onClose: () => store.set({ error: '' }) }, state.error) : null,
         state.notice ? h(Banner, { kind: 'info', onClose: () => store.set({ notice: '' }) }, state.notice) : null,
         // Middle: the only flexing region; every view scrolls inside it.
-        h('div', { className: 'nenm-main' }, body),
+        h('div', { className: 'wyym-main' }, body),
         // Bottom: transport bar, pinned below the scrolling content.
         h(NowPlaying, { store, player }),
         // Rounded sign-in dialog, opened from the account menu or the sign-in prompt.
@@ -2256,7 +2347,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           ? h(
               'div',
               {
-                className: 'nenm-overlay',
+                className: 'wyym-overlay',
                 role: 'presentation',
                 onClick: (event) => {
                   if (event.target === event.currentTarget) setLoginOpen(false);
@@ -2264,14 +2355,14 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               },
               h(
                 'div',
-                { className: 'nenm-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('addAccount') },
+                { className: 'wyym-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('addAccount') },
                 h(
                   'div',
-                  { className: 'nenm-row' },
-                  h('span', { className: 'nenm-title nenm-grow' }, t('addAccount')),
+                  { className: 'wyym-row' },
+                  h('span', { className: 'wyym-title wyym-grow' }, t('addAccount')),
                   h(
                     'button',
-                    { type: 'button', className: 'nenm-btn nenm-iconbtn', 'aria-label': t('close'), title: t('close'), onClick: () => setLoginOpen(false) },
+                    { type: 'button', className: 'wyym-btn wyym-iconbtn', 'aria-label': t('close'), title: t('close'), onClick: () => setLoginOpen(false) },
                     h(Icon, { d: GLYPH.close.d, size: 15 }),
                   ),
                 ),
@@ -2309,8 +2400,8 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         'button',
         {
           type: 'button',
-          className: open ? 'nenm-fbtn is-on' : 'nenm-fbtn',
-          'data-dsh-plugin': 'netease-music',
+          className: open ? 'wyym-fbtn is-on' : 'wyym-fbtn',
+          'data-dsh-plugin': 'wyymusic-player',
           'data-dsh-part': 'entry',
           title: label,
           'aria-label': label,
@@ -2333,50 +2424,80 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
     // last shape and the CSS drops the area's opacity, freezing the strip where
     // the song stopped. `prefers-reduced-motion` skips the loop entirely.
     function Pulse({ playing }) {
-      const areaRef = useRef(null);
+      const canvasRef = useRef(null);
       const rafRef = useRef(0);
-      // First paint shows a flat baseline; the frame loop replaces it with the
-      // real spectrum the instant audio flows.
-      const base = useMemo(() => pulsePaths(new Array(PULSE_COLUMNS).fill(14)), []);
+      // Flat baseline shown before any audio flows (and while paused, when the
+      // loop stops and the last drawn shape stays on screen).
+      const FLAT = useMemo(() => new Array(PULSE_COLUMNS).fill(14), []);
+
+      // Backing-store sizing, kept out of the frame loop: reading layout every
+      // frame would itself force the style/layout flush this component exists to
+      // avoid. A ResizeObserver reports the CSS size instead.
       useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return undefined;
+        const resize = () => {
+          const rect = canvas.getBoundingClientRect();
+          const dpr = window.devicePixelRatio || 1;
+          const width = Math.max(1, Math.round(rect.width * dpr));
+          const height = Math.max(1, Math.round(rect.height * dpr));
+          if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+            drawPulse(canvas, FLAT, pulseColor(canvas));
+          }
+        };
+        resize();
+        let observer = null;
+        if (typeof ResizeObserver !== 'undefined') {
+          observer = new ResizeObserver(resize);
+          observer.observe(canvas);
+        }
+        window.addEventListener('resize', resize);
+        return () => {
+          if (observer) observer.disconnect();
+          window.removeEventListener('resize', resize);
+        };
+      }, [FLAT]);
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return undefined;
         const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        if (reduced || !playing) return undefined;
+        // Reduced motion (and the paused state): leave the canvas on its flat
+        // baseline / last drawn shape rather than running a frame loop.
+        if (reduced) {
+          drawPulse(canvas, FLAT, pulseColor(canvas));
+          return undefined;
+        }
+        if (!playing) return undefined;
         let freq = null;
+        let color = pulseColor(canvas);
+        let frame = 0;
         const tick = () => {
           rafRef.current = window.requestAnimationFrame(tick);
           const player = playerRef.current;
           const got = player && typeof player.getAudio === 'function' ? player.getAudio() : { audio: null, analyser: null };
           const audio = got.audio;
           const analyser = got.analyser;
-          if (!audio || !analyser || !areaRef.current) return;
+          if (!audio || !analyser) return;
           if (!freq || freq.length !== analyser.frequencyBinCount) freq = new Uint8Array(analyser.frequencyBinCount);
           analyser.getByteFrequencyData(freq);
-          const heights = pulseHeights(freq);
-          // Filled area only — no connecting outline; each band's top edge steps
-          // from one column to the next so the strip reads as a spectrum area.
-          let area = `M0 100`;
-          for (let column = 0; column < PULSE_COLUMNS; column += 1) area += `L${column} ${100 - heights[column]}L${column + 1} ${100 - heights[column]}`;
-          area += `L${PULSE_COLUMNS} 100Z`;
-          areaRef.current.setAttribute('d', area);
+          // Re-read the themed colour about once a second, not every frame:
+          // getComputedStyle flushes style, which is the cost being avoided here.
+          frame += 1;
+          if (frame % 60 === 0) color = pulseColor(canvas);
+          drawPulse(canvas, pulseHeights(freq), color);
         };
         rafRef.current = window.requestAnimationFrame(tick);
         return () => {
           if (rafRef.current) window.cancelAnimationFrame(rafRef.current);
         };
-      }, [playing]);
+      }, [playing, FLAT]);
       return h(
         'div',
-        { className: 'nenm-dockPulse', 'data-playing': playing ? 'true' : 'false', 'aria-hidden': 'true' },
-        h(
-          'svg',
-          {
-            className: 'nenm-dockPulseSvg',
-            viewBox: `0 0 ${PULSE_COLUMNS} 100`,
-            preserveAspectRatio: 'none',
-            focusable: 'false',
-          },
-          h('path', { ref: areaRef, className: 'nenm-dockPulseArea', d: base.area }),
-        ),
+        { className: 'wyym-dockPulse', 'data-playing': playing ? 'true' : 'false', 'aria-hidden': 'true' },
+        h('canvas', { ref: canvasRef, className: 'wyym-dockPulseCanvas' }),
       );
     }
 
@@ -2513,9 +2634,21 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
             // Fraction of this cell the character position has reached.
             const lit = span > 0 ? (pos - u.c0) / span : (pos >= u.c1 ? 1 : 0);
             const clamped = Math.max(0, Math.min(1, lit));
-            node.style.clipPath = `inset(0 ${((1 - clamped) * 100).toFixed(2)}% 0 0)`;
+            const clip = `inset(0 ${((1 - clamped) * 100).toFixed(2)}% 0 0)`;
+            // Only touch the DOM when the value really changed. Assigning an
+            // identical string still dirties style, and one frame used to write
+            // every cell on the line even though only the syllable being sung
+            // moves — on a 60-character line that is 60 pointless invalidations
+            // per frame.
+            if (u.lastClip === clip) continue;
+            u.lastClip = clip;
+            node.style.clipPath = clip;
           }
         };
+        // A fresh effect run may sit on reused unit objects but brand-new DOM
+        // nodes (React re-keys on the line), so drop the cache once to guarantee
+        // the first painted frame is correct.
+        for (const u of unitsRef.current) u.lastClip = undefined;
         frame = window.requestAnimationFrame(tick);
         return () => {
           if (frame) window.cancelAnimationFrame(frame);
@@ -2559,17 +2692,17 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         unitsRef.current = entries;
         return h(
           'span',
-          { className: 'nenm-dockKaraoke' },
+          { className: 'wyym-dockKaraoke' },
           entries.map((entry, i) =>
             h(
               'span',
-              { key: i, className: 'nenm-dockSeg' },
+              { key: i, className: 'wyym-dockSeg' },
               // The base copy is only a visual underlay: the fill layer carries the same
               // text, so without `aria-hidden` the accessibility tree (and text selection)
               // sees every character twice — measured: `textContent` came out as
               // "第第一一句句歌歌词词内内容容". Screen readers would read each line twice.
-              h('span', { className: 'nenm-dockSegBase', 'aria-hidden': 'true' }, units[i]),
-              h('span', { ref: entry.ref, className: 'nenm-dockSegFill' }, units[i]),
+              h('span', { className: 'wyym-dockSegBase', 'aria-hidden': 'true' }, units[i]),
+              h('span', { ref: entry.ref, className: 'wyym-dockSegFill' }, units[i]),
             ),
           ),
         );
@@ -2590,19 +2723,19 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         return h(
           'div',
           {
-            className: 'nenm-dock',
-            'data-dsh-plugin': 'netease-music',
+            className: 'wyym-dock',
+            'data-dsh-plugin': 'wyymusic-player',
             'data-dsh-part': 'dock',
             'data-open': open ? 'true' : 'false',
             'aria-hidden': open ? 'false' : 'true',
           },
           h(
             'div',
-            { className: 'nenm-dockClip' },
+            { className: 'wyym-dockClip' },
             h(
               'div',
-              { className: 'nenm-dockPanel' },
-              h('div', { className: 'nenm-dockLyrics' }, h('div', { className: 'nenm-dockLine is-idle' }, t('dockIdle'))),
+              { className: 'wyym-dockPanel' },
+              h('div', { className: 'wyym-dockLyrics' }, h('div', { className: 'wyym-dockLine is-idle' }, t('dockIdle'))),
             ),
           ),
         );
@@ -2611,44 +2744,44 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
       return h(
         'div',
         {
-          className: 'nenm-dock',
-          'data-dsh-plugin': 'netease-music',
+          className: 'wyym-dock',
+          'data-dsh-plugin': 'wyymusic-player',
           'data-dsh-part': 'dock',
           'data-open': open ? 'true' : 'false',
           'aria-hidden': open ? 'false' : 'true',
         },
         h(
           'div',
-          { className: 'nenm-dockClip' },
+          { className: 'wyym-dockClip' },
           h(
             'div',
-            { className: 'nenm-dockPanel' },
+            { className: 'wyym-dockPanel' },
             h(
               'div',
-              { className: 'nenm-dockLead' },
+              { className: 'wyym-dockLead' },
               // Cover to the LEFT of the title, per the layout the user asked for.
               track.cover
-                ? h('img', { className: 'nenm-dockCover', src: track.cover, alt: '', loading: 'lazy' })
-                : h('div', { className: 'nenm-dockCover', 'aria-hidden': 'true' }),
+                ? h('img', { className: 'wyym-dockCover', src: track.cover, alt: '', loading: 'lazy' })
+                : h('div', { className: 'wyym-dockCover', 'aria-hidden': 'true' }),
               h(
                 'div',
-                { className: 'nenm-dockMeta' },
-                h('span', { className: 'nenm-dockTitle' }, track.name),
-                h('span', { className: 'nenm-dockArtist' }, track.artists || ''),
+                { className: 'wyym-dockMeta' },
+                h('span', { className: 'wyym-dockTitle' }, track.name),
+                h('span', { className: 'wyym-dockArtist' }, track.artists || ''),
               ),
             ),
             h(
               'div',
-              { className: 'nenm-dockLyrics' },
+              { className: 'wyym-dockLyrics' },
               index >= 0 && currentLine
                 ? h(
                     'div',
-                    { key: `cur-${index}`, className: 'nenm-dockLine nenm-dockLine-enter' },
+                    { key: `cur-${index}`, className: 'wyym-dockLine wyym-dockLine-enter' },
                     renderLine(currentLine),
                   )
                 : lines.length
-                  ? h('div', { className: 'nenm-dockLine is-idle' }, t('dockSoon'))
-                  : h('div', { className: 'nenm-dockLine is-idle' }, t('noLyric')),
+                  ? h('div', { className: 'wyym-dockLine is-idle' }, t('dockSoon'))
+                  : h('div', { className: 'wyym-dockLine is-idle' }, t('noLyric')),
             ),
             // Far right of the strip, per the layout the user asked for.
             h(Pulse, { playing: state.playing }),
@@ -2672,7 +2805,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         sidebar.openTab(KIND);
         return true;
       } catch (error) {
-        console.warn('[netease-music] could not open the panel:', error && error.message);
+        console.warn('[wyymusic-player] could not open the panel:', error && error.message);
         return false;
       }
     }
@@ -2684,7 +2817,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
         try {
           ctx.locale.register(NS, { zh: DICT.zh, en: DICT.en });
         } catch (error) {
-          console.warn('[netease-music] locale registration fell back:', error && error.message);
+          console.warn('[wyymusic-player] locale registration fell back:', error && error.message);
         }
         try {
           const locale = ctx.locale.getLocale();
@@ -2692,7 +2825,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           ctx.effect(() => ctx.locale.subscribe(() => {
             const current = ctx.locale.getLocale();
             translator.setLocale(current && current.active);
-          }), 'netease-music: locale');
+          }), 'wyymusic-player: locale');
         } catch {
           /* keep the default language */
         }
@@ -2740,7 +2873,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           () => () => {
             playerRef.current.release();
           },
-          'netease-music: audio element',
+          'wyymusic-player: audio element',
         );
 
         // The Sidebar shortcut renders outside the panel subtree, so the
@@ -2755,7 +2888,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
           return () => {
             if (style.parentNode) style.parentNode.removeChild(style);
           };
-        }, 'netease-music: stylesheet');
+        }, 'wyymusic-player: stylesheet');
 
         ctx.effect(
           () =>
@@ -2775,7 +2908,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                 },
               ],
             }),
-          'netease-music: right-Sidebar tab type',
+          'wyymusic-player: right-Sidebar tab type',
         );
 
         ctx.effect(
@@ -2783,7 +2916,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
             ctx.slots.inject('sidebar.right.pane.tab', () =>
               ctx.slots.register({ name: 'sidebar.right.pane.tab', key: PACKAGE_ID }, Root),
             ),
-          'netease-music: right-Sidebar tab body',
+          'wyymusic-player: right-Sidebar tab body',
         );
 
         // Open the panel once per browser profile; afterwards the saved layout
@@ -2796,15 +2929,15 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
             ctx.slots.inject('sidebar.footer.action', () => {
               try {
                 return ctx.slots.register(
-                  { name: 'sidebar.footer.action', id: 'netease-music', order: 20, locale: NS },
+                  { name: 'sidebar.footer.action', id: 'wyymusic-player', order: 20, locale: NS },
                   FooterEntry,
                 );
               } catch (error) {
-                console.warn('[netease-music] Sidebar shortcut registration failed:', error && error.message);
+                console.warn('[wyymusic-player] Sidebar shortcut registration failed:', error && error.message);
                 return () => {};
               }
             }),
-          'netease-music: left-Sidebar shortcut',
+          'wyymusic-player: left-Sidebar shortcut',
         );
 
         // The lyrics strip above the composer. A session-scoped seat, so it
@@ -2821,15 +2954,15 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
             ctx.slots.inject('conversation.input.dock', () => {
               try {
                 return ctx.slots.register(
-                  { name: 'conversation.input.dock', id: 'netease-music', order: 200 },
+                  { name: 'conversation.input.dock', id: 'wyymusic-player', order: 200 },
                   NowPlayingDock,
                 );
               } catch (error) {
-                console.warn('[netease-music] lyrics dock registration failed:', error && error.message);
+                console.warn('[wyymusic-player] lyrics dock registration failed:', error && error.message);
                 return () => {};
               }
             }),
-          'netease-music: lyrics dock',
+          'wyymusic-player: lyrics dock',
         );
 
         if (sidebar && typeof sidebar.openTab === 'function' && sidebar.mounted) {
@@ -2852,7 +2985,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
                 markAutoOpened();
                 done = true;
               } catch (error) {
-                console.warn('[netease-music] could not open the panel:', error && error.message);
+                console.warn('[wyymusic-player] could not open the panel:', error && error.message);
               }
             };
             const unsubscribe = sidebar.mounted.subscribe(open);
@@ -2861,7 +2994,7 @@ div:has(> * > .nenm-dock[data-open=true]) [data-composer-card=true]{transition:n
               unsubscribe();
               window.clearTimeout(timer);
             };
-          }, 'netease-music: first open');
+          }, 'wyymusic-player: first open');
         }
       },
     };

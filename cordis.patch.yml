@@ -1,9 +1,9 @@
 # NetEase Cloud Music for the DSH right sidebar.
 #
-# One Host row: it owns the /api/dsh-netease-music/* routes (NetEase API proxy,
+# One Host row: it owns the /api/dsh-wyymusic-player/* routes (NetEase API proxy,
 # login, audio streaming). The browser half is an ordinary `dsh.client` module
 # declared in package.json, so it needs no row of its own.
 - insert:
-    - id: netease-music
-      name: '@local/dsh-netease-music'
+    - id: wyymusic-player
+      name: '@local/dsh-wyymusic-player'
       config: {}

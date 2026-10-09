@@ -1,19 +1,19 @@
 /**
  * Host half of the NetEase Cloud Music plugin.
  *
- * Owns one prefix route, `/api/dsh-netease-music`, and answers it from
- * `lib/netease.js`. It exists because the browser cannot reach `music.163.com`
+ * Owns one prefix route, `/api/dsh-wyymusic-player`, and answers it from
+ * `lib/wyy.js`. It exists because the browser cannot reach `music.163.com`
  * itself: the NetEase gateways send no CORS headers, the audio CDN needs a
  * matching Referer, and the session cookie must not live in page storage.
  *
  * The browser half is a `dsh.client` module declared in `package.json`.
  */
 import { Readable } from 'node:stream';
-import { NeteaseClient, NeteaseError } from './lib/netease.js';
+import { NeteaseClient, NeteaseError } from './lib/wyy.js';
 
 export const inject = ['webServer'];
 
-const ROUTE_PATH = '/api/dsh-netease-music';
+const ROUTE_PATH = '/api/dsh-wyymusic-player';
 
 const DEFAULT_AUDIO_HOSTS = [
   '.music.126.net',
@@ -299,7 +299,7 @@ export function apply(ctx, config = {}) {
         sendJson(res, status === 200 ? 400 : status, { ok: false, error: error.message, code: error.code });
         return;
       }
-      console.warn('[netease-music] route failed:', error);
+      console.warn('[wyymusic-player] route failed:', error);
       if (!res.headersSent) sendJson(res, 500, { ok: false, error: (error && error.message) || '内部错误' });
       else res.destroy();
     }
@@ -307,6 +307,6 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(
     () => ctx.webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler }),
-    'netease-music: api routes',
+    'wyymusic-player: api routes',
   );
 }
