@@ -58,6 +58,29 @@ function hostAllowed(hostname, suffixes) {
   return suffixes.some((suffix) => host === suffix.replace(/^\./, '') || host.endsWith(suffix));
 }
 
+/**
+ * Re-slice a full response body into one byte window, for the case where the CDN
+ * ignored a Range request. Chunks are dropped until `start` and the stream is cut
+ * at `end`, keeping the declared `content-length` honest.
+ * @param body - web ReadableStream from `fetch`
+ * @param start - first byte to emit (inclusive)
+ * @param end - last byte to emit (inclusive)
+ */
+async function* skipBytes(body, start, end) {
+  let offset = 0;
+  for await (const chunk of Readable.fromWeb(body)) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const chunkStart = offset;
+    const chunkEnd = offset + buffer.length - 1;
+    offset += buffer.length;
+    if (chunkEnd < start) continue;
+    const from = Math.max(0, start - chunkStart);
+    const to = Math.min(buffer.length, end - chunkStart + 1);
+    if (to > from) yield buffer.subarray(from, to);
+    if (chunkEnd >= end) return;
+  }
+}
+
 export function apply(ctx, config = {}) {
   const settings = config && typeof config === 'object' ? config : {};
   const client = new NeteaseClient({
@@ -100,11 +123,25 @@ export function apply(ctx, config = {}) {
         error: `音频源返回 HTTP ${upstream.status}`,
       });
     }
+    // The client asked for a byte range. If the CDN ignored it and answered 200 with the
+    // whole object, passing that 200 straight through would tell the browser the resource
+    // is not seekable: `<audio>` then *silently discards* `currentTime` assignments and
+    // replays from the very start, which is exactly the "drag the bar and the song
+    // restarts" symptom. Answering 206 ourselves keeps the stream addressable.
+    const rangeHeader = req.headers.range ? String(req.headers.range) : '';
+    const total = Number(upstream.headers.get('content-length')) || 0;
+    const wantsRange = /^bytes=/.test(rangeHeader);
+    const upstreamRange = upstream.headers.get('content-range');
+    const seekable = upstream.status === 206 && Boolean(upstreamRange);
     const out = {
       'content-type': upstream.headers.get('content-type') || 'audio/mpeg',
-      'accept-ranges': 'bytes',
       'cache-control': 'no-store',
     };
+    // Advertise range support whenever this proxy can actually honour a range: either the
+    // CDN gave us a real byte range, or we know the total size and can synthesise one
+    // below. Advertising it is what tells `<audio>` the stream is addressable; without it
+    // the element may treat the media as unseekable and restart from 0 on every seek.
+    if (seekable || total > 0) out['accept-ranges'] = 'bytes';
     for (const [from, to] of [
       ['content-length', 'content-length'],
       ['content-range', 'content-range'],
@@ -113,6 +150,29 @@ export function apply(ctx, config = {}) {
     ]) {
       const value = upstream.headers.get(from);
       if (value) out[to] = value;
+    }
+    // Upstream ignored the range: synthesise a correct 206 for the requested window so
+    // the element stays seekable for the rest of the track.
+    if (wantsRange && !seekable && total > 0) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+      if (match) {
+        const start = match[1] ? Number(match[1]) : 0;
+        const end = match[2] ? Math.min(Number(match[2]), total - 1) : total - 1;
+        if (Number.isFinite(start) && start <= end && start < total) {
+          out['accept-ranges'] = 'bytes';
+          out['content-range'] = `bytes ${start}-${end}/${total}`;
+          out['content-length'] = String(end - start + 1);
+          res.writeHead(206, out);
+          if (!upstream.body) {
+            res.end();
+            return undefined;
+          }
+          const stream = Readable.from(skipBytes(upstream.body, start, end));
+          stream.on('error', () => res.destroy());
+          stream.pipe(res);
+          return undefined;
+        }
+      }
     }
     res.writeHead(upstream.status, out);
     if (!upstream.body) {

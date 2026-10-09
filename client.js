@@ -977,19 +977,33 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
       // it arrives while `audio.currentTime` still reports the pre-seek spot (notably on
       // Windows, where the media pipeline lags the instruction), so the next
       // timeupdate/clockTick would write that stale reading back into the store and snap
-      // the scrubber to the start of the song. The guard therefore ignores element
-      // readings until the clock has actually moved onto (or past) the chosen spot, with
-      // a deadline so a genuinely stalled element cannot freeze the progress bar forever.
+      // the scrubber to the start of the song. Until the element clock actually lands on
+      // the chosen spot, readings from it are not trustworthy.
+      //
+      // The direction matters: after a *backward* seek the clock starts above the target
+      // and falls onto it, so a "reached or passed" test alone would release the guard on
+      // the very first stale reading and the bar would jump forward again. A deadline
+      // releases it regardless, so a stalled element cannot freeze the bar forever.
+      const SEEK_SETTLE_MS = 5000;
       let seekTarget = -1;
+      let seekFrom = 0;
       let seekStartedAt = 0;
-      function positionUsable() {
+      let seekRetryTimer = null;
+      /** True when `seconds` may be written to the store as the current position. */
+      function positionSettled(seconds) {
         if (seekTarget < 0) return true;
-        if (Date.now() - seekStartedAt > 5000) { seekTarget = -1; return true; }
+        if (Date.now() - seekStartedAt > SEEK_SETTLE_MS) {
+          seekTarget = -1;
+          return true;
+        }
+        const reached = seekTarget >= seekFrom
+          ? seconds >= seekTarget - 1.5 // forward: arrive at, or pass, the target
+          : seconds <= seekTarget + 1.5; // backward: come back down onto the target
+        if (reached) {
+          seekTarget = -1;
+          return true;
+        }
         return false;
-      }
-      function positionArrived(seconds) {
-        if (seekTarget < 0) return;
-        if (seconds >= seekTarget - 1.5 || Date.now() - seekStartedAt > 5000) seekTarget = -1;
       }
 
       /**
@@ -1026,10 +1040,10 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
         const seconds = Math.floor(now);
         if (seconds === clockSeconds) return;
         clockSeconds = seconds;
-        // While a seek is still settling, the element clock reports the pre-seek spot;
-        // writing it here is exactly the snap-back. Wait until it reaches the target.
-        if (!positionUsable()) return;
-        positionArrived(now);
+        // While a seek is still settling the element clock reports the pre-seek spot;
+        // writing it here is exactly the snap-back. This both tests and clears the guard,
+        // so the bar resumes the moment the clock lands rather than after the deadline.
+        if (!positionSettled(now)) return;
         store.set({ position: now });
       }
 
@@ -1074,8 +1088,7 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
           if (Math.floor(audio.currentTime) !== Math.floor(store.getState().position)) {
             // A settling seek must not be overwritten by the stale pre-seek reading,
             // or the scrubber snaps back to the start (measured on Windows).
-            if (!positionUsable()) return;
-            positionArrived(audio.currentTime);
+            if (!positionSettled(audio.currentTime)) return;
             store.set({ position: audio.currentTime });
           }
         });
@@ -1096,11 +1109,10 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
           syncClock();
         });
         audio.addEventListener('waiting', () => store.set({ loading: true }));
-        // The media pipeline has finished the jump: the element clock is trustworthy again.
-        // Note: `seeked` intentionally does NOT clear the guard — it fires while the
-        // element clock still reads the pre-seek position, which is exactly the stale
-        // reading the guard exists to drop. `positionArrived` clears it once the clock
-        // reaches the chosen spot (or the 5s deadline expires).
+        // `seeked` deliberately does NOT clear the guard: it fires while the element
+        // clock still reads the pre-seek position, which is exactly the stale reading the
+        // guard exists to drop. `positionSettled` releases it once the clock reaches the
+        // chosen spot (or the deadline expires).
         audio.addEventListener('playing', () => {
           store.set({ loading: false, error: '' });
           syncClock();
@@ -1120,6 +1132,11 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
           window.clearInterval(clockTimer);
           clockTimer = null;
         }
+        if (seekRetryTimer !== null) {
+          window.clearTimeout(seekRetryTimer);
+          seekRetryTimer = null;
+        }
+        seekTarget = -1;
         if (!audio) return;
         try {
           audio.pause();
@@ -1368,12 +1385,28 @@ div:has(> * > .wyym-dock[data-open=true]) [data-composer-card=true]{transition:n
             // Arm the guard *before* touching the element: the very next timeupdate can
             // still carry the pre-seek position (seeked alone does not mean the clock
             // has moved — measured it fires while currentTime still reads the old spot).
+            seekFrom = audio.currentTime;
             seekTarget = seconds;
             seekStartedAt = Date.now();
             audio.currentTime = seconds;
             store.set({ position: seconds });
             const state = store.getState();
             if (state.lyrics.length) store.set({ lyricIndex: lineIndexAt(state.lyrics, seconds) });
+            // A seek is silently *dropped* while the stream is not yet seekable (or if the
+            // element has no byte ranges at all), and the track simply keeps playing from
+            // where it was. Re-issue it briefly so a seek that lost the race with
+            // buffering still lands; `positionSettled` stops as soon as the clock arrives.
+            if (seekRetryTimer !== null) window.clearTimeout(seekRetryTimer);
+            seekRetryTimer = window.setTimeout(() => {
+              seekRetryTimer = null;
+              if (seekTarget < 0 || !audio) return;
+              if (Math.abs(audio.currentTime - seekTarget) < 1.5) return;
+              try {
+                audio.currentTime = seekTarget;
+              } catch {
+                /* still not seekable */
+              }
+            }, 700);
           } catch {
             /* not seekable yet */
             seekTarget = -1;
