@@ -3,7 +3,8 @@
 在 DSH 右侧栏里播放网易云音乐。
 
 - 插件包名:`@local/dsh-wyymusic-player`
-- 适用环境:DSH Web(需要 Host 半区代理,浏览器无法直连网易云接口)
+- 适用环境:DSH Web / DSH 桌面版(需要 Host 半区代理,浏览器无法直连网易云接口)
+- 下载:**[一键安装包 v1.0.0](https://github.com/Caiccc-a11y/dsh-wyymusic-player/releases/latest)**(Windows / Linux 双击即装)
 
 ## 功能
 
@@ -43,7 +44,29 @@
 
 ## 安装
 
-### 方法一:从 GitHub 克隆后用插件管理器安装(推荐)
+### 方法一:一键安装包(推荐,Windows / Linux)
+
+1. 到 **[Releases](https://github.com/Caiccc-a11y/dsh-wyymusic-player/releases/latest)** 下载
+   `dsh-wyymusic-player-installer-v1.0.0.zip`
+2. **解压**到任意目录(不要在压缩包里直接双击)
+3. 运行安装器:
+
+   | 系统 | 操作 |
+   |---|---|
+   | Windows | 双击 `安装.cmd`,弹窗点「是」 |
+   | Linux / macOS | 双击 `install.sh`(选「运行」/「Run in Terminal」),或终端里 `./install.sh` |
+
+4. 装完按提示重启 DSH,左侧边栏底部就会出现 ♪ 按钮
+
+> 不需要 `sudo`:插件装在 `$DSH_HOME` 里。
+> Windows 若提示「已保护你的电脑」,点「更多信息」→「仍要运行」。
+> 需要 Node.js 18 或更高版本。
+
+安装器做的事:校验 `payload/manifest.json` 的 SHA-256 → 复制插件到
+`$DSH_HOME/plugins/dsh-wyymusic-player/` → 登记进 profile(优先走官方 `dsh plugin add`)
+→ 校验依赖与路由 → 询问是否重启 DSH。解压目录之后可以随意删除,不影响已装好的插件。
+
+### 方法二:从 GitHub 克隆后用插件管理器安装
 
 ```bash
 git clone https://github.com/Caiccc-a11y/dsh-wyymusic-player.git
@@ -59,17 +82,32 @@ target: /home/你的用户名/dsh-wyymusic-player
 
 安装会自动完成 profile 清单写入、补丁应用与重启加载,对当前 profile 的所有会话生效。
 
-### 方法二:在 DSH 插件页安装
+### 方法三:在 DSH 插件页安装
 
 打开 **设置 → 插件**,选择安装本地 bundle,指向本目录(`dsh-wyymusic-player/`)即可。
 
 ### 安装后
 
 1. 左侧边栏底部点 **♪** 按钮(或右侧栏 **+** → *网易云音乐*)
-2. 首次打开会自动弹出登录页,用手机号或 Cookie 登录
+2. 首次打开会自动弹出登录页,用手机号验证码或 Cookie 登录
 3. 选择歌单开始播放
 
 ## 卸载
+
+### 用安装包装的
+
+```bash
+./install.sh --uninstall            # Linux / macOS
+node install.mjs -u                 # 通用(在解压出来的目录里执行)
+node install.mjs -u --purge         # 连同登录态一起删除
+```
+
+Windows:`powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall`
+
+卸载会从 profile 里移除登记(原配置备份为 `package.json.bak-<时间戳>`),
+并询问是否删除插件目录。**登录态默认保留**,加 `--purge` 才一并清除。
+
+### 手动装的
 
 1. 在 **设置 → 插件** 中找到 `@local/dsh-wyymusic-player`,停用或卸载
 2. 如需彻底清理,删除插件目录和登录态文件:
